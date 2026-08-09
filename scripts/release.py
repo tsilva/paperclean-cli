@@ -137,7 +137,13 @@ def checks() -> None:
     ]
     for command in commands:
         run(command)
-    distributions = sorted(str(path.relative_to(ROOT)) for path in (ROOT / "dist").iterdir())
+    distributions = sorted(
+        str(path.relative_to(ROOT))
+        for pattern in ("*.whl", "*.tar.gz")
+        for path in (ROOT / "dist").glob(pattern)
+    )
+    if len(distributions) != 2:
+        raise SystemExit(f"expected one wheel and one sdist, found {distributions}")
     run(["uv", "run", "twine", "check", *distributions])
     run(["uv", "run", "python", str(HELPER), "audit-dist", "--dist-dir", "dist"])
     wheel = next((ROOT / "dist").glob("paperclean-*-py3-none-any.whl"))
