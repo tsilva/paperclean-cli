@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "paperclean"
-version = "0.1.0"
+version = "0.1.1"
 description = "Conservatively clean phone-scanned PDF and image documents with image generation and strict review."
 readme = "README.md"
 requires-python = ">=3.11"
