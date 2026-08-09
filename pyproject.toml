@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "paperclean"
+version = "0.1.0"
+description = "Conservatively clean phone-scanned PDF and image documents with image generation and strict review."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Tiago Silva" }]
+keywords = ["ocr", "pdf", "document", "scanner", "openrouter"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Multimedia :: Graphics :: Capture :: Scanners",
+  "Topic :: Office/Business",
+]
+dependencies = [
+  "httpx>=0.28.1",
+  "numpy>=2.2",
+  "opencv-python-headless>=4.11",
+  "pikepdf>=10.0",
+  "pillow>=11.2",
+  "pypdfium2>=4.30",
+]
+
+[project.urls]
+Homepage = "https://github.com/tsilva/paperclean"
+Repository = "https://github.com/tsilva/paperclean"
+Issues = "https://github.com/tsilva/paperclean/issues"
+
+[project.scripts]
+paperclean = "paperclean.cli:main"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "pytest-cov>=6.1",
+  "ruff>=0.11",
+]
+release = [
+  "twine>=6.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/paperclean"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/README.md",
+  "/CHANGELOG.md",
+  "/pyproject.toml",
+]
+
+[tool.uv]
+exclude-newer = "7 days"
+constraint-dependencies = [
+  "mistralai!=2.4.6",
+  "guardrails-ai!=0.10.1",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+  "live: uses configured external services",
+  "local: requires optional local system tools",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests", "scripts", ".codex/skills/build-release/scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["paperclean"]
