@@ -116,12 +116,14 @@ def update_release_files(version: str) -> None:
     marker = "## Unreleased\n"
     if marker not in changelog:
         raise SystemExit("CHANGELOG.md must contain an Unreleased section")
-    changelog = changelog.replace(
-        marker,
-        f"## Unreleased\n\n## {version} - {date.today().isoformat()}\n",
-        1,
-    )
-    CHANGELOG.write_text(changelog, encoding="utf-8")
+    release_heading = re.compile(rf"(?m)^## {re.escape(version)} - \d{{4}}-\d{{2}}-\d{{2}}$")
+    if release_heading.search(changelog) is None:
+        changelog = changelog.replace(
+            marker,
+            f"## Unreleased\n\n## {version} - {date.today().isoformat()}\n",
+            1,
+        )
+        CHANGELOG.write_text(changelog, encoding="utf-8")
 
 
 def checks() -> None:
@@ -173,7 +175,10 @@ def main() -> None:
         update_release_files(version)
     checks()
     run(["git", "add", "pyproject.toml", "uv.lock", "CHANGELOG.md"])
-    run(["git", "commit", "-m", f"Release paperclean {version}"])
+    if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=ROOT).returncode != 0:
+        run(["git", "commit", "-m", f"Release paperclean {version}"])
+    else:
+        print("release-metadata\talready committed")
     tag = f"paperclean-v{version}"
     run(["git", "tag", "-a", tag, "-m", f"PaperClean {version}"])
     run(["git", "push", "--atomic", remote, f"HEAD:{branch}", tag])
