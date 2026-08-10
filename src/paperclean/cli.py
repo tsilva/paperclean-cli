@@ -39,13 +39,12 @@ from paperclean.pdfs import page_count
 from paperclean.pipeline import clean_document, report_has_fallback, report_summary
 from paperclean.preflight import CostProjection
 from paperclean.providers import ModelClient
-from paperclean.validation import check_tesseract
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="paperclean",
-        description="Clean phone-scanned PDFs and images with optional semantic review.",
+        description="Clean phone-scanned PDFs and images with mandatory model verification.",
     )
     parser.add_argument("input", type=Path, help="PDF/image file or recursively scanned directory")
     parser.add_argument("--output", type=Path, help="single-file output override")
@@ -71,14 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="AgentBridge request timeout in seconds",
     )
     parser.add_argument("--image-model", help="image generation or Codex orchestrator model")
-    parser.add_argument(
-        "--review",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="enable the five-view semantic fidelity review (default: disabled)",
-    )
-    parser.add_argument("--review-model", help="multimodal review model")
-    parser.add_argument("--ocr-lang", help="Tesseract language(s), such as eng or eng+por")
+    parser.add_argument("--review-model", help="multimodal verification model")
     parser.add_argument("--max-cost-usd", help="soft observed OpenRouter cost ceiling")
     parser.add_argument("--zdr", action="store_true", default=None, help="require ZDR endpoints")
     parser.add_argument(
@@ -90,9 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _settings(args: argparse.Namespace, relaunch_args: Sequence[str]) -> Settings:
     runtime = discover_runtime_environment()
-    backend = str(
-        args.backend or runtime.values.get("PAPERCLEAN_BACKEND", "openrouter")
-    ).strip().lower()
+    backend = (
+        str(args.backend or runtime.values.get("PAPERCLEAN_BACKEND", "openrouter")).strip().lower()
+    )
     if args.agentbridge_base_url is not None and backend != "agentbridge":
         raise ConfigurationError("--agentbridge-base-url requires --backend agentbridge")
     if runtime.keyenv_manifest is not None and backend == "openrouter":
@@ -105,9 +97,7 @@ def _settings(args: argparse.Namespace, relaunch_args: Sequence[str]) -> Setting
             "jobs": args.jobs,
             "max_attempts": args.max_attempts,
             "image_model": args.image_model,
-            "review_enabled": args.review,
             "review_model": args.review_model,
-            "ocr_lang": args.ocr_lang,
             "max_cost_usd": args.max_cost_usd,
             "zdr": args.zdr,
         },
@@ -181,13 +171,10 @@ def _confirm(projection: CostProjection, *, yes: bool) -> None:
         "Generation",
         Text(f"{projection.image_model}  ·  {projection.image_provider}"),
     )
-    if projection.review_enabled:
-        models.add_row(
-            "Review",
-            Text(f"{projection.review_model}  ·  {projection.review_provider}"),
-        )
-    else:
-        models.add_row("Review", Text("disabled", style="bold yellow"))
+    models.add_row(
+        "Verification",
+        Text(f"{projection.review_model}  ·  {projection.review_provider}"),
+    )
 
     work = Table(box=box.ROUNDED, expand=True, header_style="bold white")
     work.add_column("Work", style="cyan", no_wrap=True)
@@ -195,7 +182,7 @@ def _confirm(projection: CostProjection, *, yes: bool) -> None:
     work.add_column("Configured max", justify="right", style="yellow")
     work.add_column("Recovery ceiling", justify="right", style="magenta")
     work.add_row("Image generations", *(str(item.generations) for item in scenarios))
-    work.add_row("Fidelity reviews", *(str(item.reviews) for item in scenarios))
+    work.add_row("Fidelity verifications", *(str(item.reviews) for item in scenarios))
     work.add_row(
         "Paid model calls" if projection.billing_mode == "openrouter_usd" else "Model calls",
         *(str(item.paid_calls) for item in scenarios),
@@ -249,17 +236,6 @@ def _confirm(projection: CostProjection, *, yes: bool) -> None:
         and projection.soft_limit_usd < projection.one_pass.cost_usd
     )
     contents: list[RenderableType] = [facts, Text(), models]
-    if not projection.review_enabled:
-        contents.extend(
-            [
-                Text(),
-                Text(
-                    "SEMANTIC REVIEW DISABLED · generated pages rely on deterministic "
-                    "validation only.",
-                    style="bold yellow",
-                ),
-            ]
-        )
     contents.extend([Text(), work, Text(), balances, Text(), note])
     if soft_limit_warning:
         contents.extend(
@@ -372,7 +348,6 @@ def run(argv: Sequence[str] | None = None) -> int:
         if not paths:
             return 0
         settings = _settings(args, relaunch_args)
-        check_tesseract(settings.ocr_lang)
         pages = _count_pages(paths)
         raw_client = cast(
             ModelClient,

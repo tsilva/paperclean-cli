@@ -6,136 +6,13 @@ from PIL import Image, ImageDraw
 from paperclean.models import Discrepancy
 from paperclean.restoration import (
     REGIONAL_REPAIR_PROMPT,
-    _edge_model_is_authoritative,
     best_repair_region,
     clear_page_border,
     registered_review_pairs,
     repair_region,
     rescue_colored_marks,
-    rescue_edge_text,
     restore_source_regions,
 )
-from paperclean.validation import OcrToken
-
-
-def test_edge_text_rescue_does_not_restore_a_page_hole(monkeypatch) -> None:
-    source = Image.new("RGB", (200, 300), (235, 225, 210))
-    draw = ImageDraw.Draw(source)
-    draw.ellipse((5, 90, 25, 110), fill="black")
-    draw.rectangle((40, 286, 160, 291), fill=(40, 50, 100))
-    candidate = Image.new("RGB", source.size, "white")
-    ImageDraw.Draw(candidate).rectangle((5, 275, 30, 299), fill="black")
-    monkeypatch.setattr(
-        "paperclean.restoration._registration_matrix",
-        lambda *_args: np.eye(3),
-    )
-    ocr_results = iter(
-        [
-            [OcrToken("footer", 95, (0.2, 0.95, 0.8, 0.98))],
-            [],
-        ]
-    )
-    monkeypatch.setattr(
-        "paperclean.restoration.ocr_tokens",
-        lambda *_args: next(ocr_results),
-    )
-
-    result = rescue_edge_text(source, candidate, language="eng")
-
-    assert result.getpixel((100, 289)) != (255, 255, 255)
-    assert result.getpixel((15, 100)) == (255, 255, 255)
-    assert result.getpixel((15, 280)) == (255, 255, 255)
-
-
-def test_edge_text_rescue_keeps_exact_registered_model_footer(monkeypatch) -> None:
-    source = Image.new("RGB", (200, 300), "white")
-    candidate = Image.new("RGB", source.size, "white")
-    ImageDraw.Draw(candidate).rectangle((40, 286, 160, 291), fill=(20, 30, 120))
-    token = OcrToken("footer", 95, (0.2, 0.95, 0.8, 0.98))
-    ocr_results = iter([[token], [token]])
-    monkeypatch.setattr(
-        "paperclean.restoration._registration_matrix",
-        lambda *_args: np.eye(3),
-    )
-    monkeypatch.setattr(
-        "paperclean.restoration.ocr_tokens",
-        lambda *_args: next(ocr_results),
-    )
-
-    result = rescue_edge_text(source, candidate, language="eng")
-
-    assert result.tobytes() == candidate.tobytes()
-
-
-def test_edge_text_rescue_keeps_matches_restores_missing_and_erases_extras(
-    monkeypatch,
-) -> None:
-    source = Image.new("RGB", (200, 300), "white")
-    source_draw = ImageDraw.Draw(source)
-    source_draw.rectangle((40, 285, 60, 294), fill=(20, 30, 120))
-    source_draw.rectangle((100, 285, 120, 294), fill=(20, 30, 120))
-    candidate = Image.new("RGB", source.size, "white")
-    candidate_draw = ImageDraw.Draw(candidate)
-    candidate_draw.rectangle((40, 285, 60, 294), fill=(150, 20, 20))
-    candidate_draw.rectangle((150, 285, 170, 294), fill=(20, 20, 20))
-    source_tokens = [
-        OcrToken("matched", 95, (0.2, 0.95, 0.3, 0.98)),
-        OcrToken("missing", 95, (0.5, 0.95, 0.6, 0.98)),
-    ]
-    candidate_tokens = [
-        OcrToken("matched", 95, (0.2, 0.95, 0.3, 0.98)),
-        OcrToken("extra", 95, (0.75, 0.95, 0.85, 0.98)),
-    ]
-    ocr_results = iter([source_tokens, candidate_tokens])
-    monkeypatch.setattr(
-        "paperclean.restoration._registration_matrix",
-        lambda *_args: np.eye(3),
-    )
-    monkeypatch.setattr(
-        "paperclean.restoration.ocr_tokens",
-        lambda *_args: next(ocr_results),
-    )
-
-    result = rescue_edge_text(source, candidate, language="eng")
-
-    assert result.getpixel((50, 289)) not in {(150, 20, 20), (255, 255, 255)}
-    assert result.getpixel((110, 289)) != (255, 255, 255)
-    assert result.getpixel((160, 289)) == (255, 255, 255)
-
-
-def test_edge_text_rescue_restores_untokenized_punctuation_between_footer_words(
-    monkeypatch,
-) -> None:
-    source = Image.new("RGB", (200, 300), "white")
-    ImageDraw.Draw(source).rectangle((75, 287, 80, 291), fill=(20, 30, 120))
-    candidate = Image.new("RGB", source.size, "white")
-    source_tokens = [
-        OcrToken("left", 95, (0.2, 0.95, 0.35, 0.98)),
-        OcrToken("right", 95, (0.45, 0.95, 0.6, 0.98)),
-    ]
-    monkeypatch.setattr(
-        "paperclean.restoration._registration_matrix",
-        lambda *_args: np.eye(3),
-    )
-    ocr_results = iter([source_tokens, []])
-    monkeypatch.setattr(
-        "paperclean.restoration.ocr_tokens",
-        lambda *_args: next(ocr_results),
-    )
-
-    result = rescue_edge_text(source, candidate, language="eng")
-
-    assert result.getpixel((78, 289)) != (255, 255, 255)
-
-
-def test_duplicate_model_footer_is_not_authoritative() -> None:
-    expected = [OcrToken("footer", 95, (0.2, 0.95, 0.4, 0.98))]
-    actual = [
-        OcrToken("footer", 95, (0.2, 0.95, 0.4, 0.98)),
-        OcrToken("footer", 95, (0.5, 0.95, 0.7, 0.98)),
-    ]
-
-    assert not _edge_model_is_authoritative(expected, actual, np.eye(3), edge="bottom")
 
 
 def test_regional_prompt_requires_crisp_aligned_microprint() -> None:

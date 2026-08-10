@@ -11,10 +11,11 @@ from paperclean.errors import GlobalOpenRouterError
 # PaperClean sends one full-page comparison plus four regional comparisons.
 REVIEW_VIEWS_PER_ATTEMPT = 5
 
-# A generation can be retried once with a smaller reference image. Each review
-# can be retried once if the first structured response is invalid.
-GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT = 2
-REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT = REVIEW_VIEWS_PER_ATTEMPT * 2
+# A full-page generation can be retried once with a smaller reference image, and
+# one regional repair generation can follow a failed verification. Each verdict
+# can be retried once, and a repaired candidate must pass a second complete review.
+GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT = 3
+REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT = REVIEW_VIEWS_PER_ATTEMPT * 2 * 2
 
 # Conservative token assumptions based on the maximum image sizes PaperClean
 # sends and high-quality GPT Image output. They deliberately favor overestimation.
@@ -54,9 +55,8 @@ class CostProjection:
     max_attempts: int
     image_model: str
     image_provider: str
-    review_enabled: bool
-    review_model: str | None
-    review_provider: str | None
+    review_model: str
+    review_provider: str
     one_pass: WorkEstimate
     configured_max: WorkEstimate
     recovery_ceiling: WorkEstimate
@@ -83,8 +83,7 @@ def build_subscription_projection(
     page_total: int,
     max_attempts: int,
     image_model: str,
-    review_enabled: bool,
-    review_model: str | None,
+    review_model: str,
     backend_version: str | None,
 ) -> CostProjection:
     """Build call-count projections when Codex subscription pricing is unavailable."""
@@ -93,22 +92,22 @@ def build_subscription_projection(
         return WorkEstimate(generations=generations, reviews=reviews, cost_usd=None)
 
     configured_pages = page_total * max_attempts
-    review_multiplier = REVIEW_VIEWS_PER_ATTEMPT if review_enabled else 0
-    recovery_review_multiplier = REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT if review_enabled else 0
     return CostProjection(
         document_total=document_total,
         page_total=page_total,
         max_attempts=max_attempts,
         image_model=image_model,
         image_provider="Codex via AgentBridge",
-        review_enabled=review_enabled,
-        review_model=review_model if review_enabled else None,
-        review_provider="Codex via AgentBridge" if review_enabled else None,
-        one_pass=estimate(page_total, page_total * review_multiplier),
-        configured_max=estimate(configured_pages, configured_pages * review_multiplier),
+        review_model=review_model,
+        review_provider="Codex via AgentBridge",
+        one_pass=estimate(page_total, page_total * REVIEW_VIEWS_PER_ATTEMPT),
+        configured_max=estimate(
+            configured_pages,
+            configured_pages * REVIEW_VIEWS_PER_ATTEMPT,
+        ),
         recovery_ceiling=estimate(
             configured_pages * GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT,
-            configured_pages * recovery_review_multiplier,
+            configured_pages * REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT,
         ),
         account_remaining_usd=None,
         key_remaining_usd=None,
@@ -173,10 +172,9 @@ def build_cost_projection(
     image_model: str,
     image_provider: str,
     image_prices: UnitPrices,
-    review_enabled: bool,
-    review_model: str | None,
-    review_provider: str | None,
-    review_prices: UnitPrices | None,
+    review_model: str,
+    review_provider: str,
+    review_prices: UnitPrices,
     account_remaining_usd: Decimal | None,
     key_remaining_usd: Decimal | None,
     key_unlimited: bool,
@@ -187,23 +185,16 @@ def build_cost_projection(
         + _required(image_prices.input_text, "text-input") * GENERATION_INPUT_TEXT_TOKENS
         + _required(image_prices.output_image, "image-output") * GENERATION_OUTPUT_IMAGE_TOKENS
     )
-    review_cost = Decimal("0")
-    if review_enabled:
-        if review_prices is None or review_model is None or review_provider is None:
-            raise GlobalOpenRouterError(
-                "review endpoint metadata is required when review is enabled"
-            )
-        review_image_price = (
-            review_prices.input_image
-            if review_prices.input_image is not None
-            else review_prices.input_text
-        )
-        review_cost = (
-            _required(review_image_price, "review image-input") * REVIEW_INPUT_IMAGE_TOKENS
-            + _required(review_prices.input_text, "review text-input") * REVIEW_INPUT_TEXT_TOKENS
-            + _required(review_prices.output_text, "review text-output")
-            * REVIEW_MAX_COMPLETION_TOKENS
-        )
+    review_image_price = (
+        review_prices.input_image
+        if review_prices.input_image is not None
+        else review_prices.input_text
+    )
+    review_cost = (
+        _required(review_image_price, "review image-input") * REVIEW_INPUT_IMAGE_TOKENS
+        + _required(review_prices.input_text, "review text-input") * REVIEW_INPUT_TEXT_TOKENS
+        + _required(review_prices.output_text, "review text-output") * REVIEW_MAX_COMPLETION_TOKENS
+    )
 
     def estimate(generations: int, reviews: int) -> WorkEstimate:
         return WorkEstimate(
@@ -213,25 +204,22 @@ def build_cost_projection(
         )
 
     configured_pages = page_total * max_attempts
-    review_multiplier = REVIEW_VIEWS_PER_ATTEMPT if review_enabled else 0
-    recovery_review_multiplier = REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT if review_enabled else 0
     return CostProjection(
         document_total=document_total,
         page_total=page_total,
         max_attempts=max_attempts,
         image_model=image_model,
         image_provider=image_provider,
-        review_enabled=review_enabled,
         review_model=review_model,
         review_provider=review_provider,
-        one_pass=estimate(page_total, page_total * review_multiplier),
+        one_pass=estimate(page_total, page_total * REVIEW_VIEWS_PER_ATTEMPT),
         configured_max=estimate(
             configured_pages,
-            configured_pages * review_multiplier,
+            configured_pages * REVIEW_VIEWS_PER_ATTEMPT,
         ),
         recovery_ceiling=estimate(
             configured_pages * GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT,
-            configured_pages * recovery_review_multiplier,
+            configured_pages * REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT,
         ),
         account_remaining_usd=account_remaining_usd,
         key_remaining_usd=key_remaining_usd,

@@ -40,7 +40,6 @@ from paperclean.restoration import (
     registered_review_pairs,
     repair_region,
     rescue_colored_marks,
-    rescue_edge_text,
     restore_source_regions,
 )
 from paperclean.util import (
@@ -82,7 +81,10 @@ def _feedback(categories: list[str]) -> str:
     return "\n" + FEEDBACK_TEMPLATE.replace("{requirements}", requirements) if lines else ""
 
 
-def _reviews_accept(
+VERIFICATION_STRATEGY = "full-page-plus-four-registered-regions"
+
+
+def _verification_accepts(
     client: ModelClient,
     source: Image.Image,
     candidate: Image.Image,
@@ -202,38 +204,21 @@ def process_page(
             record.generated_height = normalized.generated_height
             recreation = rescue_colored_marks(
                 source,
-                rescue_edge_text(
-                    source,
-                    clear_page_border(finish_pristine_recreation(normalized.image)),
-                    language=settings.ocr_lang,
-                ),
+                clear_page_border(finish_pristine_recreation(normalized.image)),
             )
             record.effective_dpi = round(source_page_dpi, 2)
             candidate = finalize_candidate(recreation)
             deterministic = validate_candidate(
                 source,
                 candidate,
-                language=settings.ocr_lang,
                 min_effective_dpi=settings.min_effective_dpi,
                 effective_dpi=source_page_dpi,
             )
-            record.deterministic_issues = deterministic.issues
+            record.local_issues = deterministic.issues
             if not deterministic.accepted:
                 prompt = GENERATION_PROMPT + _feedback(["unresolved_content"])
                 continue
-            if not settings.review_enabled:
-                record.accepted = True
-                return PageOutcome(
-                    output_image=recreation,
-                    record=PageRecord(
-                        page=page_number,
-                        status="model_generated_unreviewed",
-                        source_render_sha256=source_hash,
-                        final_render_sha256=pixel_sha256(candidate),
-                        attempts=attempts,
-                    ),
-                )
-            accepted, discrepancies = _reviews_accept(client, source, candidate)
+            accepted, discrepancies = _verification_accepts(client, source, candidate)
             if not accepted:
                 source_regions = [
                     _source_region(item) for item in discrepancies if _preserve_from_source(item)
@@ -258,15 +243,14 @@ def process_page(
                 deterministic = validate_candidate(
                     source,
                     candidate,
-                    language=settings.ocr_lang,
                     min_effective_dpi=settings.min_effective_dpi,
                     effective_dpi=source_page_dpi,
                 )
-                record.deterministic_issues = deterministic.issues
+                record.local_issues = deterministic.issues
                 if deterministic.accepted and (source_regions or repair_box is not None):
-                    accepted, discrepancies = _reviews_accept(client, source, candidate)
+                    accepted, discrepancies = _verification_accepts(client, source, candidate)
             categories = list(dict.fromkeys(item.category for item in discrepancies))
-            record.review_categories = categories
+            record.verification_categories = categories
             record.accepted = accepted
             if accepted:
                 return PageOutcome(
@@ -318,8 +302,8 @@ def _core_manifest(report: DocumentReport) -> dict[str, object]:
         "source_sha256": report.source_sha256,
         "backend": report.backend,
         "billing_mode": report.billing_mode,
-        "review_enabled": report.review_enabled,
-        "models": {"image": report.image_model, "review": report.review_model},
+        "models": {"image": report.image_model, "verification": report.verification_model},
+        "verification": {"strategy": report.verification_strategy},
         "pages": [
             {"page": page.page, "status": page.status, "fallback_reason": page.fallback_reason}
             for page in report.pages
@@ -329,7 +313,7 @@ def _core_manifest(report: DocumentReport) -> dict[str, object]:
 
 def _base_report(paths: OutputPaths, settings: Settings) -> DocumentReport:
     return DocumentReport(
-        schema_version=3,
+        schema_version=4,
         run_id=uuid4().hex,
         source=str(paths.source),
         output=str(paths.output),
@@ -340,8 +324,8 @@ def _base_report(paths: OutputPaths, settings: Settings) -> DocumentReport:
             "codex_subscription" if settings.backend == "agentbridge" else "openrouter_usd"
         ),
         image_model=settings.image_model,
-        review_enabled=settings.review_enabled,
-        review_model=settings.review_model if settings.review_enabled else None,
+        verification_model=settings.review_model,
+        verification_strategy=VERIFICATION_STRATEGY,
         started_at=_now(),
     )
 
@@ -469,7 +453,7 @@ def clean_pdf(
                 raise ValueError("published PDF page count changed")
             for original, final, record in zip(originals, final_pages, report.pages, strict=True):
                 if original.text_signature != final.text_signature:
-                    raise ValueError("published PDF OCR text layer changed")
+                    raise ValueError("published PDF searchable text layer changed")
                 record.final_render_sha256 = pixel_sha256(final.image)
             report.output_sha256 = sha256_file(staged_output)
             _finish_report(report, client)

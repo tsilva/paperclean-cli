@@ -349,17 +349,15 @@ class OpenRouterClient:
             images_api=True,
             predicate=lambda params, _arch: "input_references" in params,
         )
-        self.review_endpoint = None
-        if self.settings.review_enabled:
-            self.review_endpoint = self._select_endpoint(
-                self.settings.review_model,
-                images_api=False,
-                predicate=lambda params, arch: (
-                    "image" in set(arch.get("input_modalities", []))
-                    and bool({"response_format", "structured_outputs"} & params)
-                    and bool({"max_tokens", "max_completion_tokens"} & params)
-                ),
-            )
+        self.review_endpoint = self._select_endpoint(
+            self.settings.review_model,
+            images_api=False,
+            predicate=lambda params, arch: (
+                "image" in set(arch.get("input_modalities", []))
+                and bool({"response_format", "structured_outputs"} & params)
+                and bool({"max_tokens", "max_completion_tokens"} & params)
+            ),
+        )
         if self.settings.zdr:
             response = self._request("GET", "/endpoints/zdr")
             rows = response.get("data", [])
@@ -372,8 +370,7 @@ class OpenRouterClient:
                 if isinstance(row, dict)
             }
             selected = {(self.image_endpoint.model, self.image_endpoint.provider_slug)}
-            if self.review_endpoint is not None:
-                selected.add((self.review_endpoint.model, self.review_endpoint.provider_slug))
+            selected.add((self.review_endpoint.model, self.review_endpoint.provider_slug))
             missing = selected - allowed
             if missing:
                 raise GlobalOpenRouterError("the selected model/provider pair does not support ZDR")
@@ -382,11 +379,7 @@ class OpenRouterClient:
         self, *, document_total: int, page_total: int, max_attempts: int
     ) -> CostProjection:
         image_endpoint = self._required_endpoint(self.image_endpoint, "preflight image endpoint")
-        review_endpoint = (
-            self._required_endpoint(self.review_endpoint, "preflight review endpoint")
-            if self.settings.review_enabled
-            else None
-        )
+        review_endpoint = self._required_endpoint(self.review_endpoint, "preflight review endpoint")
         account_remaining = self._account_remaining()
         key_remaining, key_unlimited = self._key_remaining()
         return build_cost_projection(
@@ -396,12 +389,9 @@ class OpenRouterClient:
             image_model=image_endpoint.model,
             image_provider=image_endpoint.provider_name,
             image_prices=image_endpoint.prices,
-            review_enabled=self.settings.review_enabled,
-            review_model=review_endpoint.model if review_endpoint is not None else None,
-            review_provider=(
-                review_endpoint.provider_name if review_endpoint is not None else None
-            ),
-            review_prices=review_endpoint.prices if review_endpoint is not None else None,
+            review_model=review_endpoint.model,
+            review_provider=review_endpoint.provider_name,
+            review_prices=review_endpoint.prices,
             account_remaining_usd=account_remaining,
             key_remaining_usd=key_remaining,
             key_unlimited=key_unlimited,

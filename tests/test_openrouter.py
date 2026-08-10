@@ -20,8 +20,8 @@ def _png_base64() -> str:
     return base64.b64encode(output.getvalue()).decode()
 
 
-def _settings(*, zdr: bool = False, review_enabled: bool = True) -> Settings:
-    return Settings(api_key="not-a-real-key", zdr=zdr, review_enabled=review_enabled)
+def _settings(*, zdr: bool = False) -> Settings:
+    return Settings(api_key="not-a-real-key", zdr=zdr)
 
 
 def test_preflight_generation_and_review_contract() -> None:
@@ -277,17 +277,14 @@ def test_cost_projection_uses_selected_endpoint_prices_and_credit_balances() -> 
     assert projection.one_pass.paid_calls == 6
     assert projection.one_pass.cost_usd == Decimal("1.189452")
     assert projection.configured_max.cost_usd == Decimal("3.568356")
-    assert projection.recovery_ceiling.paid_calls == 36
-    assert projection.recovery_ceiling.cost_usd == Decimal("7.136712")
+    assert projection.recovery_ceiling.paid_calls == 69
+    assert projection.recovery_ceiling.cost_usd == Decimal("13.239468")
     assert projection.account_remaining_usd == Decimal("0.718589992")
     assert projection.key_remaining_usd == Decimal("10")
 
 
-def test_disabled_review_skips_endpoint_and_projects_generation_only() -> None:
-    paths: list[str] = []
-
+def test_preflight_requires_a_multimodal_verification_endpoint() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        paths.append(request.url.path)
         if request.url.path.endswith("gpt-image-2/endpoints"):
             return httpx.Response(
                 200,
@@ -318,32 +315,15 @@ def test_disabled_review_skips_endpoint_and_projects_generation_only() -> None:
                     ]
                 },
             )
-        if request.url.path.endswith("/endpoints/zdr"):
-            return httpx.Response(
-                200,
-                json={"data": [{"model_id": "openai/gpt-image-2", "provider_slug": "openai"}]},
-            )
-        if request.url.path.endswith("/credits"):
-            return httpx.Response(200, json={"data": {"total_credits": 10, "total_usage": 0}})
-        if request.url.path.endswith("/key"):
-            return httpx.Response(200, json={"data": {"limit": None, "limit_remaining": None}})
+        if request.url.path.endswith("gpt-5.6-sol/endpoints"):
+            return httpx.Response(200, json={"data": {"endpoints": []}})
         raise AssertionError(request.url)
 
-    settings = _settings(zdr=True, review_enabled=False)
-    with OpenRouterClient(settings, transport=httpx.MockTransport(handler)) as client:
+    with (
+        OpenRouterClient(_settings(), transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(GlobalOpenRouterError, match="supports image review"),
+    ):
         client.preflight()
-        projection = client.cost_projection(document_total=1, page_total=1, max_attempts=3)
-
-    assert not any("gpt-5.6-sol" in path for path in paths)
-    assert projection.review_enabled is False
-    assert projection.review_model is None
-    assert projection.review_provider is None
-    assert projection.one_pass.reviews == 0
-    assert projection.one_pass.paid_calls == 1
-    assert projection.one_pass.cost_usd == Decimal("0.344652")
-    assert projection.configured_max.cost_usd == Decimal("1.033956")
-    assert projection.recovery_ceiling.paid_calls == 6
-    assert projection.recovery_ceiling.cost_usd == Decimal("2.067912")
 
 
 def test_image_too_large_400_is_typed_for_one_downscale_retry() -> None:

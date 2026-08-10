@@ -19,7 +19,6 @@ DEFAULT_AGENTBRIDGE_MODEL = "codex/gpt-5.6-sol"
 DEFAULT_AGENTBRIDGE_TIMEOUT = 660
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_JOBS = 1
-DEFAULT_OCR_LANG = "eng"
 
 
 def _positive_int(name: str, value: object) -> int:
@@ -62,10 +61,8 @@ class Settings:
     base_url: str = DEFAULT_BASE_URL
     image_model: str = DEFAULT_IMAGE_MODEL
     review_model: str = DEFAULT_REVIEW_MODEL
-    review_enabled: bool = False
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     jobs: int = DEFAULT_JOBS
-    ocr_lang: str = DEFAULT_OCR_LANG
     max_cost_usd: Decimal | None = None
     zdr: bool = False
     render_dpi: int = 300
@@ -109,9 +106,7 @@ class Settings:
             ).rstrip("/")
             url_name = "PAPERCLEAN_AGENTBRIDGE_BASE_URL"
         else:
-            base_url = str(
-                choose("base_url", "OPENROUTER_BASE_URL", DEFAULT_BASE_URL)
-            ).rstrip("/")
+            base_url = str(choose("base_url", "OPENROUTER_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
             url_name = "OPENROUTER_BASE_URL"
         if not base_url.startswith(("https://", "http://")):
             raise ConfigurationError(f"{url_name} must be an HTTP(S) URL")
@@ -133,18 +128,16 @@ class Settings:
         review_model = str(
             choose("review_model", "PAPERCLEAN_REVIEW_MODEL", default_review_model)
         ).strip()
-        review_enabled = _bool(
-            "PAPERCLEAN_REVIEW", choose("review_enabled", "PAPERCLEAN_REVIEW", False)
-        )
+        if "PAPERCLEAN_REVIEW" in env:
+            raise ConfigurationError(
+                "PAPERCLEAN_REVIEW was removed; model verification is always enabled"
+            )
         if "/" not in image_model or "/" not in review_model:
             raise ConfigurationError("model identifiers must use author/model form")
         if backend == "agentbridge" and (
             not image_model.startswith("codex/") or not review_model.startswith("codex/")
         ):
             raise ConfigurationError("AgentBridge models must use the codex/ namespace")
-        ocr_lang = str(choose("ocr_lang", "PAPERCLEAN_OCR_LANG", DEFAULT_OCR_LANG)).strip()
-        if not ocr_lang:
-            raise ConfigurationError("PAPERCLEAN_OCR_LANG cannot be empty")
         max_cost_usd = _optional_money(
             "PAPERCLEAN_MAX_COST_USD",
             choose("max_cost_usd", "PAPERCLEAN_MAX_COST_USD", None),
@@ -160,13 +153,11 @@ class Settings:
             base_url=base_url,
             image_model=image_model,
             review_model=review_model,
-            review_enabled=review_enabled,
             max_attempts=_positive_int(
                 "PAPERCLEAN_MAX_ATTEMPTS",
                 choose("max_attempts", "PAPERCLEAN_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS),
             ),
             jobs=_positive_int("PAPERCLEAN_JOBS", choose("jobs", "PAPERCLEAN_JOBS", DEFAULT_JOBS)),
-            ocr_lang=ocr_lang,
             max_cost_usd=max_cost_usd,
             zdr=zdr,
             agentbridge_timeout=_positive_int(

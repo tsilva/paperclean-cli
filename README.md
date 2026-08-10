@@ -6,22 +6,22 @@
 
 PaperClean is a Python CLI for people who need cleaner PDFs or images from phone
 photos and poor scans without silently accepting changed content. Give it a PDF,
-JPEG, PNG, or folder; it recreates each page, runs deterministic fidelity checks,
-and falls back to the original page when a candidate cannot be trusted.
+JPEG, PNG, or folder; it recreates each page, runs local safety checks, requires
+mandatory model verification, and falls back to the original page when a candidate
+cannot be trusted.
 
 Complete page pixels are sent through the configured backend: OpenRouter, or a
 loopback AgentBridge server backed by your authenticated Codex CLI. Before work
 begins, PaperClean shows a preflight and asks for confirmation. OpenRouter mode
 includes live cost and credit checks; AgentBridge mode shows model-call ceilings
-because Codex subscription USD usage is not exposed. Optional `--review` adds
-five-view multimodal fidelity review; it is disabled by default.
+because Codex subscription USD usage is not exposed. Every generated page must pass
+local geometry and foreground checks plus five-view multimodal fidelity verification.
 
 ## Install
 
-PaperClean requires Python 3.11 or newer and Tesseract 5.5 or newer. On macOS:
+PaperClean requires Python 3.11 or newer. Keyenv is recommended on macOS:
 
 ```bash
-brew install tesseract
 uv tool install keyenv-macos
 uv tool install paperclean
 ```
@@ -53,7 +53,7 @@ Run PaperClean from the directory containing your document:
 paperclean document.pdf
 ```
 
-To run generation and optional review through Codex instead, start the sibling
+To run generation and mandatory verification through Codex instead, start the sibling
 AgentBridge checkout and select its backend. No OpenRouter key is needed:
 
 ```bash
@@ -70,11 +70,10 @@ paperclean document.pdf --backend agentbridge --yes
 paperclean document.pdf                         # clean one PDF
 paperclean photo.jpg                            # clean one JPEG or PNG
 paperclean scans/                               # recursively clean a directory
-paperclean document.pdf --review                # add five-view semantic review
 paperclean document.pdf --backend agentbridge   # use Codex through local AgentBridge
 paperclean document.pdf --max-attempts 3        # set generation attempts per page
 paperclean document.pdf --max-cost-usd 1.00     # set a soft observed-cost ceiling
-paperclean document.pdf --ocr-lang eng+por      # select Tesseract languages
+paperclean document.pdf --review-model openai/gpt-5.6-sol  # select verifier
 paperclean --help                               # show every CLI option
 ```
 
@@ -99,11 +98,9 @@ CLI flags override environment variables, which override these defaults:
 | `PAPERCLEAN_AGENTBRIDGE_BASE_URL` | `http://127.0.0.1:8082/api/v1` |
 | `PAPERCLEAN_AGENTBRIDGE_TIMEOUT` | `660` |
 | `PAPERCLEAN_IMAGE_MODEL` | `openai/gpt-image-2` |
-| `PAPERCLEAN_REVIEW` | `false` |
 | `PAPERCLEAN_REVIEW_MODEL` | `openai/gpt-5.6-sol` |
 | `PAPERCLEAN_MAX_ATTEMPTS` | `3` |
 | `PAPERCLEAN_JOBS` | `1` |
-| `PAPERCLEAN_OCR_LANG` | `eng` |
 | `PAPERCLEAN_MAX_COST_USD` | unset |
 | `PAPERCLEAN_ZDR` | `false` |
 
@@ -117,16 +114,16 @@ configuration, then repository-level configuration.
 
 - Supported inputs are PDF, JPEG, and PNG. Directory traversal is recursive and
   does not follow directory symlinks.
-- Local OCR, registration, foreground, and resolution checks are required before
-  any generated page is accepted. Rejected candidates retry with feedback, then
-  fall back to the original page when attempts are exhausted.
-- PaperClean restores registered signatures, stamps, and edge microprint from
-  the source without restoring stains, skew, shadows, or damaged paper edges.
+- Local registration, foreground, canvas, and resolution checks run before mandatory
+  five-view model verification. Rejected candidates retry with feedback, then fall
+  back to the original page when attempts are exhausted.
+- PaperClean restores registered signatures, stamps, and reviewer-identified edge
+  content from the source without restoring stains, skew, shadows, or damaged edges.
 - The cost preflight checks selected endpoints, live pricing, available credits,
   and the conservative recovery ceiling. `--yes` accepts the displayed
   preflight but never overrides insufficient known credits.
 - The AgentBridge preflight verifies Codex availability, authentication, native
-  image generation, strict JSON Schema output, and the selected model. It shows
+  image generation, strict JSON Schema output, and both selected models. It shows
   conservative call counts and records observable orchestration tokens, but
   does not invent a USD cost or Codex subscription balance.
 - `--max-cost-usd` is a soft ceiling. One completed request or an ambiguously

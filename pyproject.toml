@@ -9,7 +9,7 @@ description = "Conservatively clean phone-scanned PDF and image documents with i
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Tiago Silva" }]
-keywords = ["ocr", "pdf", "document", "scanner", "openrouter"]
+keywords = ["pdf", "document", "scanner", "openrouter", "image-generation"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",

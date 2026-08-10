@@ -20,10 +20,7 @@ def _png_bytes(color: str = "white") -> bytes:
 
 
 def _settings(**overrides: object) -> Settings:
-    values: dict[str, object] = {
-        "backend": "agentbridge",
-        "review_enabled": True,
-    }
+    values: dict[str, object] = {"backend": "agentbridge"}
     values.update(overrides)
     return Settings.from_sources(values, {})
 
@@ -59,9 +56,7 @@ def test_agentbridge_client_runs_preflight_generation_and_structured_review() ->
             return httpx.Response(
                 200,
                 json={
-                    "data": [
-                        {"b64_json": base64.b64encode(generated).decode("ascii")}
-                    ],
+                    "data": [{"b64_json": base64.b64encode(generated).decode("ascii")}],
                     "usage": {
                         "prompt_tokens": 3,
                         "completion_tokens": 2,
@@ -95,9 +90,7 @@ def test_agentbridge_client_runs_preflight_generation_and_structured_review() ->
             )
         raise AssertionError(f"unexpected path: {path}")
 
-    with AgentBridgeClient(
-        _settings(), transport=httpx.MockTransport(handler)
-    ) as client:
+    with AgentBridgeClient(_settings(), transport=httpx.MockTransport(handler)) as client:
         client.preflight()
         projection = client.cost_projection(
             document_total=1,
@@ -149,9 +142,10 @@ def test_agentbridge_preflight_rejects_missing_strict_capability() -> None:
             },
         )
 
-    with AgentBridgeClient(
-        _settings(), transport=httpx.MockTransport(handler)
-    ) as client, pytest.raises(GlobalProviderError, match="required authenticated"):
+    with (
+        AgentBridgeClient(_settings(), transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(GlobalProviderError, match="required authenticated"),
+    ):
         client.preflight()
 
 
@@ -159,9 +153,10 @@ def test_agentbridge_generation_normalizes_invalid_image_response() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": [{"b64_json": "not-base64"}]})
 
-    with AgentBridgeClient(
-        _settings(review_enabled=False), transport=httpx.MockTransport(handler)
-    ) as client, pytest.raises(ProviderError, match="invalid image"):
+    with (
+        AgentBridgeClient(_settings(), transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ProviderError, match="invalid image"),
+    ):
         client.generate(
             Image.new("RGB", (8, 8), "white"),
             "clean",

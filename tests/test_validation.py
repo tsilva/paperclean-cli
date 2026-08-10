@@ -3,41 +3,53 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image, ImageDraw
 
-from paperclean.validation import OcrToken, _foreground_issues, _registered_token_issues
+from paperclean.validation import (
+    _foreground_issues,
+    _has_meaningful_foreground,
+    validate_candidate,
+)
 
 
-def _token(text: str, x: float, y: float) -> OcrToken:
-    return OcrToken(text=text, confidence=95, box=(x, y, x + 0.02, y + 0.02))
+def test_blank_page_does_not_require_registration() -> None:
+    blank = np.full((500, 400), 255, dtype=np.uint8)
+
+    assert _has_meaningful_foreground(blank) is False
 
 
-def test_token_matching_uses_nearest_duplicate_instead_of_ocr_order() -> None:
-    source = [_token("same", 0.1, 0.1), _token("same", 0.8, 0.8)]
-    candidate = [_token("same", 0.8, 0.8), _token("same", 0.1, 0.1)]
+def test_authored_ink_requires_registration() -> None:
+    image = Image.new("L", (400, 500), "white")
+    ImageDraw.Draw(image).rectangle((80, 200, 320, 210), fill="black")
 
-    assert _registered_token_issues(source, candidate, np.eye(3)) == []
-
-
-def test_token_matching_tolerates_small_ocr_segmentation_noise() -> None:
-    source = [_token(str(index), index / 20, 0.5) for index in range(10)]
-    candidate = source[:-1]
-
-    assert _registered_token_issues(source, candidate, np.eye(3)) == []
+    assert _has_meaningful_foreground(np.asarray(image)) is True
 
 
-def test_token_matching_rejects_material_text_loss() -> None:
-    source = [_token(str(index), index / 20, 0.5) for index in range(10)]
-    candidate = source[:-2]
+def test_registration_failure_rejects_content_bearing_page(monkeypatch) -> None:
+    source = Image.new("RGB", (400, 500), "white")
+    ImageDraw.Draw(source).rectangle((80, 200, 320, 210), fill="black")
+    monkeypatch.setattr("paperclean.validation._registration_matrix", lambda *_args: None)
 
-    assert _registered_token_issues(source, candidate, np.eye(3)) == [
-        "missing_or_changed_high_confidence_text"
-    ]
+    result = validate_candidate(
+        source,
+        source.copy(),
+        min_effective_dpi=150,
+        effective_dpi=300,
+    )
+
+    assert "page_registration_failed" in result.issues
 
 
-def test_token_matching_distinguishes_moved_text() -> None:
-    source = [_token(str(index), index / 20, 0.1) for index in range(10)]
-    candidate = [_token(str(index), index / 20, 0.5) for index in range(10)]
+def test_registration_failure_allows_genuinely_blank_page(monkeypatch) -> None:
+    blank = Image.new("RGB", (400, 500), "white")
+    monkeypatch.setattr("paperclean.validation._registration_matrix", lambda *_args: None)
 
-    assert _registered_token_issues(source, candidate, np.eye(3)) == ["high_confidence_text_moved"]
+    result = validate_candidate(
+        blank,
+        blank.copy(),
+        min_effective_dpi=150,
+        effective_dpi=300,
+    )
+
+    assert result.accepted is True
 
 
 def test_foreground_check_tolerates_restored_stroke_shape() -> None:

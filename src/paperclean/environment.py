@@ -32,7 +32,6 @@ _DOTENV_NAMES = frozenset(
         "PAPERCLEAN_REVIEW_MODEL",
         "PAPERCLEAN_MAX_ATTEMPTS",
         "PAPERCLEAN_JOBS",
-        "PAPERCLEAN_OCR_LANG",
         "PAPERCLEAN_MAX_COST_USD",
         "PAPERCLEAN_ZDR",
     }

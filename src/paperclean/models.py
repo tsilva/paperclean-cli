@@ -7,7 +7,6 @@ from typing import Any, Literal
 
 PageStatus = Literal[
     "model_generated_clean",
-    "model_generated_unreviewed",
     "original_fallback",
 ]
 DiscrepancyCategory = Literal[
@@ -58,8 +57,8 @@ class ReviewVerdict:
 @dataclass(slots=True)
 class AttemptRecord:
     number: int
-    deterministic_issues: list[str] = field(default_factory=list)
-    review_categories: list[str] = field(default_factory=list)
+    local_issues: list[str] = field(default_factory=list)
+    verification_categories: list[str] = field(default_factory=list)
     generated_width: int | None = None
     generated_height: int | None = None
     effective_dpi: float | None = None
@@ -88,8 +87,8 @@ class DocumentReport:
     backend: Literal["openrouter", "agentbridge"]
     billing_mode: Literal["openrouter_usd", "codex_subscription"]
     image_model: str
-    review_enabled: bool
-    review_model: str | None
+    verification_model: str
+    verification_strategy: str
     started_at: str
     finished_at: str | None = None
     pages: list[PageRecord] = field(default_factory=list)

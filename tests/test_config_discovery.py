@@ -11,37 +11,26 @@ from paperclean.errors import ConfigurationError, InputError
 
 def test_settings_precedence_and_cost_serialization() -> None:
     settings = Settings.from_sources(
-        {"jobs": 4, "image_model": "vendor/cli-model", "review_enabled": False},
+        {"jobs": 4, "image_model": "vendor/cli-model"},
         {
             "OPENROUTER_API_KEY": "secret",
             "PAPERCLEAN_IMAGE_MODEL": "vendor/env-model",
-            "PAPERCLEAN_REVIEW": "true",
             "PAPERCLEAN_REVIEW_MODEL": "vendor/reviewer",
             "PAPERCLEAN_MAX_COST_USD": "1.25",
         },
     )
     assert settings.image_model == "vendor/cli-model"
-    assert settings.review_enabled is False
     assert settings.review_model == "vendor/reviewer"
     assert settings.jobs == 4
     assert settings.paid_jobs == 1
 
 
-def test_review_is_disabled_by_default_and_can_be_enabled_from_environment() -> None:
-    assert Settings.from_sources({}, {"OPENROUTER_API_KEY": "secret"}).review_enabled is False
-    assert (
+def test_legacy_review_toggle_is_rejected_because_verification_is_mandatory() -> None:
+    with pytest.raises(ConfigurationError, match="always enabled"):
         Settings.from_sources(
-            {}, {"OPENROUTER_API_KEY": "secret", "PAPERCLEAN_REVIEW": "true"}
-        ).review_enabled
-        is True
-    )
-    assert (
-        Settings.from_sources(
-            {"review_enabled": True},
+            {},
             {"OPENROUTER_API_KEY": "secret", "PAPERCLEAN_REVIEW": "false"},
-        ).review_enabled
-        is True
-    )
+        )
 
 
 def test_settings_require_secret() -> None:

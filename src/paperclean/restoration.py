@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from itertools import pairwise
 from typing import Protocol
 
 import cv2
@@ -17,7 +16,7 @@ from paperclean.imaging import (
 )
 from paperclean.models import Discrepancy
 from paperclean.prompting import REGIONAL_REPAIR_PROMPT
-from paperclean.validation import OcrToken, _registration_matrix, ocr_tokens
+from paperclean.validation import _registration_matrix
 
 REPAIRABLE_CATEGORIES = {
     "changed_text",
@@ -138,132 +137,6 @@ def _remove_scanner_borders(pixels: np.ndarray) -> np.ndarray:
     return result
 
 
-def _nearest_edge(box: tuple[float, float, float, float]) -> str:
-    left, top, right, bottom = box
-    distances = {"left": left, "top": top, "right": 1 - right, "bottom": 1 - bottom}
-    return min(distances, key=distances.__getitem__)
-
-
-def _edge_distance(box: tuple[float, float, float, float], edge: str) -> float:
-    left, top, right, bottom = box
-    return {"left": left, "top": top, "right": 1 - right, "bottom": 1 - bottom}[edge]
-
-
-def _token_region(
-    tokens: Sequence[OcrToken],
-    *,
-    horizontal_padding: float,
-    vertical_padding: float,
-) -> tuple[float, float, float, float]:
-    widths = [token.box[2] - token.box[0] for token in tokens]
-    heights = [token.box[3] - token.box[1] for token in tokens]
-    pad_x = float(np.median(widths)) * horizontal_padding
-    pad_y = float(np.median(heights)) * vertical_padding
-    return (
-        max(0.0, min(token.box[0] for token in tokens) - pad_x),
-        max(0.0, min(token.box[1] for token in tokens) - pad_y),
-        min(1.0, max(token.box[2] for token in tokens) + pad_x),
-        min(1.0, max(token.box[3] for token in tokens) + pad_y),
-    )
-
-
-def _outer_microprint(tokens: Sequence[OcrToken], edge: str) -> list[OcrToken]:
-    """Find an outermost small-text cluster from the page's own OCR distribution."""
-    reliable_heights = [token.box[3] - token.box[1] for token in tokens if token.confidence >= 60]
-    if not reliable_heights:
-        return []
-    typical_height = float(np.median(reliable_heights))
-    edge_tokens = [token for token in tokens if _nearest_edge(token.box) == edge]
-    if not edge_tokens:
-        return []
-    ordered = sorted(edge_tokens, key=lambda token: _edge_distance(token.box, edge))
-    gaps = [
-        _edge_distance(right.box, edge) - _edge_distance(left.box, edge)
-        for left, right in pairwise(ordered)
-    ]
-    meaningful = [(gap, index) for index, gap in enumerate(gaps) if gap > typical_height * 3]
-    cluster = ordered[: max(meaningful)[1] + 1] if meaningful else ordered
-    cluster_height = float(np.median([token.box[3] - token.box[1] for token in cluster]))
-    if (
-        _edge_distance(cluster[0].box, edge) > typical_height * 8
-        or cluster_height > typical_height * 1.1
-    ):
-        return []
-    return cluster
-
-
-def _paint_region(
-    mask: np.ndarray, region: tuple[float, float, float, float], value: int = 255
-) -> None:
-    height, width = mask.shape
-    left, top, right, bottom = region
-    cv2.rectangle(
-        mask,
-        (max(0, round(left * width)), max(0, round(top * height))),
-        (min(width - 1, round(right * width)), min(height - 1, round(bottom * height))),
-        value,
-        thickness=-1,
-    )
-
-
-def _edge_model_is_authoritative(
-    expected: Sequence[OcrToken],
-    actual: Sequence[OcrToken],
-    candidate_to_source: np.ndarray,
-    *,
-    edge: str,
-) -> bool:
-    """Require exact, spatially registered OCR before retaining generated edge text."""
-    if not expected:
-        return False
-
-    expected_region = _token_region(
-        expected,
-        horizontal_padding=12,
-        vertical_padding=12,
-    )
-
-    registered: list[tuple[OcrToken, float, float]] = []
-    for token in actual:
-        center_x = (token.box[0] + token.box[2]) / 2
-        center_y = (token.box[1] + token.box[3]) / 2
-        point = candidate_to_source @ np.array([center_x, center_y, 1.0], dtype=np.float64)
-        if abs(point[2]) < 1e-9:
-            continue
-        mapped_x = float(point[0] / point[2])
-        mapped_y = float(point[1] / point[2])
-        in_edge = (
-            _nearest_edge((mapped_x, mapped_y, mapped_x, mapped_y)) == edge
-            and expected_region[0] <= mapped_x <= expected_region[2]
-            and expected_region[1] <= mapped_y <= expected_region[3]
-        )
-        if in_edge:
-            registered.append((token, mapped_x, mapped_y))
-
-    used: set[int] = set()
-    for expected_token in expected:
-        if expected_token.confidence < 60:
-            return False
-        expected_x = (expected_token.box[0] + expected_token.box[2]) / 2
-        expected_y = (expected_token.box[1] + expected_token.box[3]) / 2
-        choices = [
-            (
-                max(abs(expected_x - mapped_x), abs(expected_y - mapped_y)),
-                index,
-            )
-            for index, (token, mapped_x, mapped_y) in enumerate(registered)
-            if index not in used and token.confidence >= 60 and token.text == expected_token.text
-        ]
-        if not choices:
-            return False
-        distance, index = min(choices)
-        if distance > 0.025:
-            return False
-        used.add(index)
-    # Reject duplicated/invented model tokens as well as missing source tokens.
-    return len(used) == len(registered)
-
-
 def restore_source_regions(
     source: Image.Image,
     candidate: Image.Image,
@@ -357,79 +230,6 @@ def rescue_colored_marks(source: Image.Image, candidate: Image.Image) -> Image.I
                 )
             )
     return restore_source_regions(source, candidate, regions)
-
-
-def rescue_edge_text(source: Image.Image, candidate: Image.Image, *, language: str) -> Image.Image:
-    """Restore tiny edge text while leaving holes, dirt, and page borders removed."""
-    source = source.convert("RGB")
-    candidate = candidate.convert("RGB")
-    if source.size != candidate.size:
-        return candidate
-    source_gray = cv2.cvtColor(np.asarray(source), cv2.COLOR_RGB2GRAY)
-    candidate_gray = cv2.cvtColor(np.asarray(candidate), cv2.COLOR_RGB2GRAY)
-    candidate_to_source = _registration_matrix(source_gray, candidate_gray)
-    if candidate_to_source is None:
-        return candidate
-
-    tokens = ocr_tokens(source, language)
-    candidate_tokens = ocr_tokens(candidate, language)
-    unsafe_edges = {
-        edge: edge_tokens
-        for edge in ("left", "top", "right", "bottom")
-        if (edge_tokens := _outer_microprint(tokens, edge))
-        and not _edge_model_is_authoritative(
-            edge_tokens,
-            candidate_tokens,
-            candidate_to_source,
-            edge=edge,
-        )
-    }
-    if not unsafe_edges:
-        return candidate
-
-    width, height = source.size
-    mask = np.zeros((height, width), dtype=np.uint8)
-    erase = np.zeros_like(mask)
-    for edge_tokens in unsafe_edges.values():
-        # Restore one continuous registered strip. Besides avoiding seams between OCR
-        # boxes, this preserves punctuation and marks that OCR did not tokenize.
-        _paint_region(
-            mask,
-            _token_region(
-                edge_tokens,
-                horizontal_padding=1,
-                vertical_padding=1,
-            ),
-        )
-        # Clear a larger, OCR-derived neighborhood before compositing so locally
-        # displaced or duplicated model text cannot remain around the exact source.
-        _paint_region(
-            erase,
-            _token_region(
-                edge_tokens,
-                horizontal_padding=12,
-                vertical_padding=12,
-            ),
-        )
-
-    source_to_candidate = np.linalg.inv(candidate_to_source)
-    matrix = _pixel_matrix(source_to_candidate, width, height)
-    warped_source = cv2.warpPerspective(
-        _clean_source(source),
-        matrix,
-        (width, height),
-        flags=cv2.INTER_LANCZOS4,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(255, 255, 255),
-    )
-    warped_source = _remove_paper_tone(warped_source)
-    warped_source = _remove_scanner_borders(warped_source)
-    warped_mask = cv2.warpPerspective(mask, matrix, (width, height), flags=cv2.INTER_NEAREST)
-    warped_erase = cv2.warpPerspective(erase, matrix, (width, height), flags=cv2.INTER_NEAREST)
-    result = np.asarray(candidate).copy()
-    result[warped_erase > 0] = 255
-    result[warped_mask > 0] = warped_source[warped_mask > 0]
-    return Image.fromarray(result, "RGB")
 
 
 def best_repair_region(
