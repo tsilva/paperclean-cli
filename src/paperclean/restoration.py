@@ -169,9 +169,7 @@ def _token_region(
 
 def _outer_microprint(tokens: Sequence[OcrToken], edge: str) -> list[OcrToken]:
     """Find an outermost small-text cluster from the page's own OCR distribution."""
-    reliable_heights = [
-        token.box[3] - token.box[1] for token in tokens if token.confidence >= 60
-    ]
+    reliable_heights = [token.box[3] - token.box[1] for token in tokens if token.confidence >= 60]
     if not reliable_heights:
         return []
     typical_height = float(np.median(reliable_heights))
@@ -183,9 +181,7 @@ def _outer_microprint(tokens: Sequence[OcrToken], edge: str) -> list[OcrToken]:
         _edge_distance(right.box, edge) - _edge_distance(left.box, edge)
         for left, right in pairwise(ordered)
     ]
-    meaningful = [
-        (gap, index) for index, gap in enumerate(gaps) if gap > typical_height * 3
-    ]
+    meaningful = [(gap, index) for index, gap in enumerate(gaps) if gap > typical_height * 3]
     cluster = ordered[: max(meaningful)[1] + 1] if meaningful else ordered
     cluster_height = float(np.median([token.box[3] - token.box[1] for token in cluster]))
     if (

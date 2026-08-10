@@ -22,4 +22,3 @@ REGIONAL_REPAIR_PROMPT = load_prompt("regional-repair.md")
 REVIEW_SYSTEM_PROMPT = load_prompt("review-system.md")
 REVIEW_PROMPT = load_prompt("review.md")
 FEEDBACK_TEMPLATE = load_prompt("feedback.md")
-
