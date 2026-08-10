@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-PageStatus = Literal["model_generated_clean", "original_fallback"]
+PageStatus = Literal[
+    "model_generated_clean",
+    "model_generated_unreviewed",
+    "original_fallback",
+]
 DiscrepancyCategory = Literal[
     "changed_text",
     "missing_text",
@@ -82,7 +86,8 @@ class DocumentReport:
     source_sha256: str
     output_sha256: str | None
     image_model: str
-    review_model: str
+    review_enabled: bool
+    review_model: str | None
     started_at: str
     finished_at: str | None = None
     pages: list[PageRecord] = field(default_factory=list)

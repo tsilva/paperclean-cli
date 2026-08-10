@@ -29,6 +29,7 @@ dependencies = [
   "pikepdf>=10.0",
   "pillow>=11.2",
   "pypdfium2>=4.30",
+  "rich>=15,<16",
 ]
 
 [project.urls]
@@ -52,6 +53,7 @@ release = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/paperclean"]
+artifacts = ["src/paperclean/prompts/**/*.md"]
 
 [tool.hatch.build.targets.sdist]
 include = [

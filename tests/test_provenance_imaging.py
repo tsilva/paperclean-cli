@@ -5,7 +5,7 @@ import struct
 
 from PIL import Image
 
-from paperclean.imaging import normalize_generated, review_views
+from paperclean.imaging import finish_pristine_recreation, normalize_generated, review_views
 from paperclean.provenance import (
     embed_jpeg,
     embed_png,
@@ -63,3 +63,16 @@ def test_review_views_are_full_page_plus_four_regions() -> None:
     assert len(views) == 5
     assert views[0].size == (1000, 800)
     assert all(view.width > 500 and view.height > 400 for view in views[1:])
+
+
+def test_pristine_recreation_whitens_paper_and_retains_foreground() -> None:
+    source = Image.new("RGB", (120, 160), "white")
+    for y in range(70, 74):
+        for x in range(20, 100):
+            source.putpixel((x, y), (30, 25, 20))
+
+    candidate = finish_pristine_recreation(source)
+
+    assert candidate.size == source.size
+    assert candidate.getpixel((10, 10)) == (255, 255, 255)
+    assert max(candidate.getpixel((60, 71))) < 80

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import re
 import shutil
 import subprocess
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 
 import cv2
@@ -19,6 +21,8 @@ from paperclean.imaging import encode_png
 from paperclean.util import private_workdir, private_write
 
 MIN_TESSERACT_VERSION = (5, 5)
+MIN_HIGH_CONFIDENCE_OCR_MATCH_RATIO = 0.89
+OCR_POSITION_TOLERANCE = 0.12
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,35 +117,55 @@ def _registered_token_issues(
     source: list[OcrToken], candidate: list[OcrToken], candidate_to_source: np.ndarray
 ) -> list[str]:
     expected = [token for token in source if token.confidence >= 80]
-    issues: list[str] = []
-    cursor = 0
+    if not expected:
+        return []
+
+    transformed_candidates: list[tuple[OcrToken, float, float]] = []
+    for token in candidate:
+        center_x = (token.box[0] + token.box[2]) / 2
+        center_y = (token.box[1] + token.box[3]) / 2
+        transformed = candidate_to_source @ np.array([center_x, center_y, 1.0], dtype=np.float64)
+        if abs(transformed[2]) < 1e-9:
+            continue
+        transformed_candidates.append(
+            (
+                token,
+                float(transformed[0] / transformed[2]),
+                float(transformed[1] / transformed[2]),
+            )
+        )
+
+    used: set[int] = set()
+    spatial_matches = 0
     for token in expected:
-        match: OcrToken | None = None
-        match_index = cursor
-        while match_index < len(candidate):
-            if candidate[match_index].text == token.text:
-                match = candidate[match_index]
-                break
-            match_index += 1
-        if match is None:
-            issues.append("missing_or_changed_high_confidence_text")
-            break
         source_cx = (token.box[0] + token.box[2]) / 2
         source_cy = (token.box[1] + token.box[3]) / 2
-        match_cx = (match.box[0] + match.box[2]) / 2
-        match_cy = (match.box[1] + match.box[3]) / 2
-        point = np.array([match_cx, match_cy, 1.0], dtype=np.float64)
-        transformed = candidate_to_source @ point
-        if abs(transformed[2]) < 1e-9:
-            issues.append("page_registration_failed")
-            break
-        match_cx = float(transformed[0] / transformed[2])
-        match_cy = float(transformed[1] / transformed[2])
-        if abs(source_cx - match_cx) > 0.12 or abs(source_cy - match_cy) > 0.12:
-            issues.append("high_confidence_text_moved")
-            break
-        cursor = match_index + 1
-    return issues
+        choices = [
+            (
+                max(abs(source_cx - match_cx), abs(source_cy - match_cy)),
+                index,
+            )
+            for index, (match, match_cx, match_cy) in enumerate(transformed_candidates)
+            if index not in used and match.text == token.text
+        ]
+        if not choices:
+            continue
+        distance, match_index = min(choices)
+        if distance <= OCR_POSITION_TOLERANCE:
+            used.add(match_index)
+            spatial_matches += 1
+
+    required = math.ceil(len(expected) * MIN_HIGH_CONFIDENCE_OCR_MATCH_RATIO)
+    if spatial_matches >= required:
+        return []
+    text_matches = sum(
+        (
+            Counter(token.text for token in expected) & Counter(token.text for token in candidate)
+        ).values()
+    )
+    if text_matches >= required:
+        return ["high_confidence_text_moved"]
+    return ["missing_or_changed_high_confidence_text"]
 
 
 def _registration_matrix(source: np.ndarray, candidate: np.ndarray) -> np.ndarray | None:
@@ -225,10 +249,17 @@ def _foreground_issues(
     source_pixels = int(np.count_nonzero(src_ink))
     if source_pixels < 32:
         return []
-    intersection = int(np.count_nonzero(cv2.bitwise_and(src_ink, cand_ink)))
-    missing_ratio = 1 - intersection / source_pixels
+    # Regenerated glyphs have different antialiasing and stroke shapes. Compare
+    # against a local support area so intentional de-skewing and pristine
+    # re-typesetting do not look like wholesale foreground loss.
+    support = np.ones((21, 21), np.uint8)
+    candidate_support = cv2.dilate(cand_ink, support)
+    source_support = cv2.dilate(src_ink, support)
+    missing = cv2.bitwise_and(src_ink, cv2.bitwise_not(candidate_support))
+    missing_ratio = int(np.count_nonzero(missing)) / source_pixels
     candidate_pixels = max(1, int(np.count_nonzero(cand_ink)))
-    invented_ratio = 1 - intersection / candidate_pixels
+    invented = cv2.bitwise_and(cand_ink, cv2.bitwise_not(source_support))
+    invented_ratio = int(np.count_nonzero(invented)) / candidate_pixels
     issues: list[str] = []
     # These are intentionally permissive to exposure/background cleanup but reject
     # catastrophic content loss. Semantic review handles smaller visual changes.

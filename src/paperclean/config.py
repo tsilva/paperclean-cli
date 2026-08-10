@@ -58,6 +58,7 @@ class Settings:
     base_url: str = DEFAULT_BASE_URL
     image_model: str = DEFAULT_IMAGE_MODEL
     review_model: str = DEFAULT_REVIEW_MODEL
+    review_enabled: bool = False
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     jobs: int = DEFAULT_JOBS
     ocr_lang: str = DEFAULT_OCR_LANG
@@ -108,6 +109,9 @@ class Settings:
         review_model = str(
             choose("review_model", "PAPERCLEAN_REVIEW_MODEL", DEFAULT_REVIEW_MODEL)
         ).strip()
+        review_enabled = _bool(
+            "PAPERCLEAN_REVIEW", choose("review_enabled", "PAPERCLEAN_REVIEW", False)
+        )
         if "/" not in image_model or "/" not in review_model:
             raise ConfigurationError("model identifiers must use author/model form")
         ocr_lang = str(choose("ocr_lang", "PAPERCLEAN_OCR_LANG", DEFAULT_OCR_LANG)).strip()
@@ -118,6 +122,7 @@ class Settings:
             base_url=base_url,
             image_model=image_model,
             review_model=review_model,
+            review_enabled=review_enabled,
             max_attempts=_positive_int(
                 "PAPERCLEAN_MAX_ATTEMPTS",
                 choose("max_attempts", "PAPERCLEAN_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS),

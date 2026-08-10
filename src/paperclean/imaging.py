@@ -8,7 +8,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
 from paperclean.errors import InputError
 from paperclean.util import sha256_bytes
@@ -119,19 +119,33 @@ def normalize_generated(
     )
 
 
-def review_views(image: Image.Image, *, overlap: float = 0.10) -> list[Image.Image]:
-    """Return the full page followed by four overlapping two-by-two tiles."""
-    width, height = image.size
+def finish_pristine_recreation(image: Image.Image) -> Image.Image:
+    """Sharpen the pristine model recreation after source-size upscaling."""
+    return image.convert("RGB").filter(
+        ImageFilter.UnsharpMask(radius=0.8, percent=100, threshold=3)
+    )
+
+
+def review_boxes(
+    size: tuple[int, int], *, overlap: float = 0.10
+) -> list[tuple[int, int, int, int]]:
+    """Return four overlapping two-by-two page boxes."""
+    width, height = size
     overlap_x = round(width * overlap / 2)
     overlap_y = round(height * overlap / 2)
     midpoint_x = width // 2
     midpoint_y = height // 2
-    boxes = [
+    return [
         (0, 0, min(width, midpoint_x + overlap_x), min(height, midpoint_y + overlap_y)),
         (max(0, midpoint_x - overlap_x), 0, width, min(height, midpoint_y + overlap_y)),
         (0, max(0, midpoint_y - overlap_y), min(width, midpoint_x + overlap_x), height),
         (max(0, midpoint_x - overlap_x), max(0, midpoint_y - overlap_y), width, height),
     ]
+
+
+def review_views(image: Image.Image, *, overlap: float = 0.10) -> list[Image.Image]:
+    """Return the full page followed by four overlapping two-by-two tiles."""
+    boxes = review_boxes(image.size, overlap=overlap)
     return [image, *(image.crop(box) for box in boxes)]
 
 

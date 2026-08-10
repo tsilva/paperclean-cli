@@ -990,6 +990,7 @@ dependencies = [
     { name = "pikepdf" },
     { name = "pillow" },
     { name = "pypdfium2" },
+    { name = "rich" },
 ]
 
 [package.dev-dependencies]
@@ -1011,6 +1012,7 @@ requires-dist = [
     { name = "pikepdf", specifier = ">=10.0" },
     { name = "pillow", specifier = ">=11.2" },
     { name = "pypdfium2", specifier = ">=4.30" },
+    { name = "rich", specifier = ">=15,<16" },
 ]
 
 [package.metadata.requires-dev]
