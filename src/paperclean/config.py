@@ -6,7 +6,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 from paperclean.errors import ConfigurationError
@@ -14,6 +14,9 @@ from paperclean.errors import ConfigurationError
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_IMAGE_MODEL = "openai/gpt-image-2"
 DEFAULT_REVIEW_MODEL = "openai/gpt-5.6-sol"
+DEFAULT_AGENTBRIDGE_BASE_URL = "http://127.0.0.1:8082/api/v1"
+DEFAULT_AGENTBRIDGE_MODEL = "codex/gpt-5.6-sol"
+DEFAULT_AGENTBRIDGE_TIMEOUT = 660
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_JOBS = 1
 DEFAULT_OCR_LANG = "eng"
@@ -55,6 +58,7 @@ def _bool(name: str, value: object) -> bool:
 @dataclass(frozen=True, slots=True)
 class Settings:
     api_key: str
+    backend: Literal["openrouter", "agentbridge"] = "openrouter"
     base_url: str = DEFAULT_BASE_URL
     image_model: str = DEFAULT_IMAGE_MODEL
     review_model: str = DEFAULT_REVIEW_MODEL
@@ -67,6 +71,7 @@ class Settings:
     render_dpi: int = 300
     max_reference_edge: int = 4096
     min_effective_dpi: int = 150
+    agentbridge_timeout: int = DEFAULT_AGENTBRIDGE_TIMEOUT
 
     @property
     def paid_jobs(self) -> int:
@@ -86,39 +91,72 @@ class Settings:
                 return value
             return env.get(env_key, default)
 
+        backend = str(choose("backend", "PAPERCLEAN_BACKEND", "openrouter")).strip().lower()
+        if backend not in {"openrouter", "agentbridge"}:
+            raise ConfigurationError("PAPERCLEAN_BACKEND must be openrouter or agentbridge")
         api_key = str(choose("api_key", "OPENROUTER_API_KEY", "")).strip()
-        if not api_key:
+        if backend == "openrouter" and not api_key:
             raise ConfigurationError(
                 "OPENROUTER_API_KEY is required; inject it with `keyenv run -- ...`"
             )
-        base_url = str(choose("base_url", "OPENROUTER_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
+        if backend == "agentbridge":
+            base_url = str(
+                choose(
+                    "base_url",
+                    "PAPERCLEAN_AGENTBRIDGE_BASE_URL",
+                    DEFAULT_AGENTBRIDGE_BASE_URL,
+                )
+            ).rstrip("/")
+            url_name = "PAPERCLEAN_AGENTBRIDGE_BASE_URL"
+        else:
+            base_url = str(
+                choose("base_url", "OPENROUTER_BASE_URL", DEFAULT_BASE_URL)
+            ).rstrip("/")
+            url_name = "OPENROUTER_BASE_URL"
         if not base_url.startswith(("https://", "http://")):
-            raise ConfigurationError("OPENROUTER_BASE_URL must be an HTTP(S) URL")
+            raise ConfigurationError(f"{url_name} must be an HTTP(S) URL")
         parsed_base = urlparse(base_url)
-        if parsed_base.scheme == "http" and parsed_base.hostname not in {
-            "localhost",
-            "127.0.0.1",
-            "::1",
-        }:
-            raise ConfigurationError(
-                "OPENROUTER_BASE_URL must use HTTPS unless it targets localhost"
-            )
+        loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+        if backend == "agentbridge" and parsed_base.hostname not in loopback_hosts:
+            raise ConfigurationError("AgentBridge must use a loopback URL")
+        if parsed_base.scheme == "http" and parsed_base.hostname not in loopback_hosts:
+            raise ConfigurationError(f"{url_name} must use HTTPS unless it targets localhost")
+        default_image_model = (
+            DEFAULT_AGENTBRIDGE_MODEL if backend == "agentbridge" else DEFAULT_IMAGE_MODEL
+        )
+        default_review_model = (
+            DEFAULT_AGENTBRIDGE_MODEL if backend == "agentbridge" else DEFAULT_REVIEW_MODEL
+        )
         image_model = str(
-            choose("image_model", "PAPERCLEAN_IMAGE_MODEL", DEFAULT_IMAGE_MODEL)
+            choose("image_model", "PAPERCLEAN_IMAGE_MODEL", default_image_model)
         ).strip()
         review_model = str(
-            choose("review_model", "PAPERCLEAN_REVIEW_MODEL", DEFAULT_REVIEW_MODEL)
+            choose("review_model", "PAPERCLEAN_REVIEW_MODEL", default_review_model)
         ).strip()
         review_enabled = _bool(
             "PAPERCLEAN_REVIEW", choose("review_enabled", "PAPERCLEAN_REVIEW", False)
         )
         if "/" not in image_model or "/" not in review_model:
             raise ConfigurationError("model identifiers must use author/model form")
+        if backend == "agentbridge" and (
+            not image_model.startswith("codex/") or not review_model.startswith("codex/")
+        ):
+            raise ConfigurationError("AgentBridge models must use the codex/ namespace")
         ocr_lang = str(choose("ocr_lang", "PAPERCLEAN_OCR_LANG", DEFAULT_OCR_LANG)).strip()
         if not ocr_lang:
             raise ConfigurationError("PAPERCLEAN_OCR_LANG cannot be empty")
+        max_cost_usd = _optional_money(
+            "PAPERCLEAN_MAX_COST_USD",
+            choose("max_cost_usd", "PAPERCLEAN_MAX_COST_USD", None),
+        )
+        zdr = _bool("PAPERCLEAN_ZDR", choose("zdr", "PAPERCLEAN_ZDR", False))
+        if backend == "agentbridge" and max_cost_usd is not None:
+            raise ConfigurationError("--max-cost-usd is unavailable with AgentBridge")
+        if backend == "agentbridge" and zdr:
+            raise ConfigurationError("--zdr is unavailable with AgentBridge")
         return cls(
             api_key=api_key,
+            backend=cast(Literal["openrouter", "agentbridge"], backend),
             base_url=base_url,
             image_model=image_model,
             review_model=review_model,
@@ -129,9 +167,14 @@ class Settings:
             ),
             jobs=_positive_int("PAPERCLEAN_JOBS", choose("jobs", "PAPERCLEAN_JOBS", DEFAULT_JOBS)),
             ocr_lang=ocr_lang,
-            max_cost_usd=_optional_money(
-                "PAPERCLEAN_MAX_COST_USD",
-                choose("max_cost_usd", "PAPERCLEAN_MAX_COST_USD", None),
+            max_cost_usd=max_cost_usd,
+            zdr=zdr,
+            agentbridge_timeout=_positive_int(
+                "PAPERCLEAN_AGENTBRIDGE_TIMEOUT",
+                choose(
+                    "agentbridge_timeout",
+                    "PAPERCLEAN_AGENTBRIDGE_TIMEOUT",
+                    DEFAULT_AGENTBRIDGE_TIMEOUT,
+                ),
             ),
-            zdr=_bool("PAPERCLEAN_ZDR", choose("zdr", "PAPERCLEAN_ZDR", False)),
         )

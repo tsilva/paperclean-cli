@@ -23,8 +23,8 @@ class UnsafePdfError(InputError):
     """The PDF contains active or redaction content that v1 refuses to transform."""
 
 
-class OpenRouterError(PaperCleanError):
-    """Base class for normalized OpenRouter failures."""
+class ProviderError(PaperCleanError):
+    """Base class for normalized model-provider failures."""
 
     def __init__(
         self,
@@ -38,7 +38,15 @@ class OpenRouterError(PaperCleanError):
         self.status_code = status_code
 
 
-class GlobalOpenRouterError(OpenRouterError):
+class GlobalProviderError(ProviderError):
+    """A systemic provider failure that must stop scheduling new documents."""
+
+
+class OpenRouterError(ProviderError):
+    """Backwards-compatible OpenRouter-specific provider failure."""
+
+
+class GlobalOpenRouterError(GlobalProviderError, OpenRouterError):
     """A systemic failure that must stop scheduling new documents."""
 
 

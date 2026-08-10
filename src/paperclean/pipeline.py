@@ -15,9 +15,9 @@ from paperclean.discovery import OutputPaths
 from paperclean.errors import (
     ContentPolicyError,
     CostLimitReached,
-    GlobalOpenRouterError,
-    OpenRouterError,
+    GlobalProviderError,
     PayloadTooLargeError,
+    ProviderError,
     ReviewerResponseError,
 )
 from paperclean.imaging import (
@@ -30,10 +30,10 @@ from paperclean.imaging import (
     source_dpi,
 )
 from paperclean.models import AttemptRecord, Discrepancy, DocumentReport, PageRecord
-from paperclean.openrouter import OpenRouterClient
 from paperclean.pdfs import build_pdf, inspect_pdf, render_overlay_preview, render_pages
 from paperclean.prompting import FEEDBACK_TEMPLATE, GENERATION_PROMPT, load_prompt
 from paperclean.provenance import embed_image, manifest_wrapper, write_report
+from paperclean.providers import ModelClient
 from paperclean.restoration import (
     best_repair_region,
     clear_page_border,
@@ -65,7 +65,7 @@ def _now() -> str:
 
 
 def _error_name(exc: BaseException) -> str:
-    if isinstance(exc, OpenRouterError) and exc.error_type:
+    if isinstance(exc, ProviderError) and exc.error_type:
         return exc.error_type[:80]
     return type(exc).__name__
 
@@ -83,7 +83,7 @@ def _feedback(categories: list[str]) -> str:
 
 
 def _reviews_accept(
-    client: OpenRouterClient,
+    client: ModelClient,
     source: Image.Image,
     candidate: Image.Image,
 ) -> tuple[bool, list[Discrepancy]]:
@@ -175,7 +175,7 @@ def process_page(
     page_number: int,
     source_page_dpi: float,
     settings: Settings,
-    client: OpenRouterClient,
+    client: ModelClient,
     finalize_candidate: Callable[[Image.Image], Image.Image],
 ) -> PageOutcome:
     source = source.convert("RGB")
@@ -289,13 +289,13 @@ def process_page(
             fallback_reason = "cost_limit"
             cost_stopped = True
             break
-        except GlobalOpenRouterError:
+        except GlobalProviderError:
             raise
-        except (ReviewerResponseError, OpenRouterError) as exc:
+        except (ReviewerResponseError, ProviderError) as exc:
             record.error_type = _error_name(exc)
             fallback_reason = "provider_or_review_error"
             # Page-scoped provider failures consume the attempt; auth/config errors
-            # have already been normalized as GlobalOpenRouterError and propagate.
+            # have already been normalized as GlobalProviderError and propagate.
             continue
     return PageOutcome(
         output_image=source,
@@ -316,6 +316,8 @@ def _core_manifest(report: DocumentReport) -> dict[str, object]:
         "schema_version": report.schema_version,
         "run_id": report.run_id,
         "source_sha256": report.source_sha256,
+        "backend": report.backend,
+        "billing_mode": report.billing_mode,
         "review_enabled": report.review_enabled,
         "models": {"image": report.image_model, "review": report.review_model},
         "pages": [
@@ -327,12 +329,16 @@ def _core_manifest(report: DocumentReport) -> dict[str, object]:
 
 def _base_report(paths: OutputPaths, settings: Settings) -> DocumentReport:
     return DocumentReport(
-        schema_version=2,
+        schema_version=3,
         run_id=uuid4().hex,
         source=str(paths.source),
         output=str(paths.output),
         source_sha256=sha256_file(paths.source),
         output_sha256=None,
+        backend=settings.backend,
+        billing_mode=(
+            "codex_subscription" if settings.backend == "agentbridge" else "openrouter_usd"
+        ),
         image_model=settings.image_model,
         review_enabled=settings.review_enabled,
         review_model=settings.review_model if settings.review_enabled else None,
@@ -340,16 +346,20 @@ def _base_report(paths: OutputPaths, settings: Settings) -> DocumentReport:
     )
 
 
-def _finish_report(report: DocumentReport, client: OpenRouterClient) -> None:
+def _finish_report(report: DocumentReport, client: ModelClient) -> None:
     report.finished_at = _now()
-    report.cost_usd = float(client.costs.total)
+    report.backend_version = getattr(client, "backend_version", None)
+    report.cost_usd = float(client.costs.total) if report.backend == "openrouter" else None
+    report.prompt_tokens = client.costs.prompt_tokens
+    report.completion_tokens = client.costs.completion_tokens
+    report.total_tokens = client.costs.total_tokens
     report.ambiguous_timeout_charges = client.costs.ambiguous_timeouts
 
 
 def clean_image(
     paths: OutputPaths,
     settings: Settings,
-    client: OpenRouterClient,
+    client: ModelClient,
     *,
     force: bool,
 ) -> DocumentReport:
@@ -394,7 +404,7 @@ def clean_image(
 def clean_pdf(
     paths: OutputPaths,
     settings: Settings,
-    client: OpenRouterClient,
+    client: ModelClient,
     *,
     force: bool,
 ) -> DocumentReport:
@@ -474,7 +484,7 @@ def clean_pdf(
 def clean_document(
     paths: OutputPaths,
     settings: Settings,
-    client: OpenRouterClient,
+    client: ModelClient,
     *,
     force: bool,
 ) -> DocumentReport:

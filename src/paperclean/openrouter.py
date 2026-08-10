@@ -119,6 +119,9 @@ class CostTracker:
         self.limit = limit
         self.total = Decimal("0")
         self.ambiguous_timeouts = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
         self._lock = threading.Lock()
 
     def before_request(self) -> None:
@@ -144,11 +147,17 @@ class CostTracker:
                 )
             if cost is not None:
                 self.total += cost
+            prompt_tokens = _as_int(usage.get("prompt_tokens"))
+            completion_tokens = _as_int(usage.get("completion_tokens"))
+            total_tokens = _as_int(usage.get("total_tokens"))
+            self.prompt_tokens += prompt_tokens or 0
+            self.completion_tokens += completion_tokens or 0
+            self.total_tokens += total_tokens or (prompt_tokens or 0) + (completion_tokens or 0)
         return UsageRecord(
             cost_usd=float(cost) if cost is not None else None,
-            prompt_tokens=_as_int(usage.get("prompt_tokens")),
-            completion_tokens=_as_int(usage.get("completion_tokens")),
-            total_tokens=_as_int(usage.get("total_tokens")),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
         )
 
     def ambiguous_timeout(self) -> None:
@@ -181,6 +190,7 @@ def _retry_after(response: httpx.Response) -> float:
 class OpenRouterClient:
     def __init__(self, settings: Settings, *, transport: httpx.BaseTransport | None = None) -> None:
         self.settings = settings
+        self.backend_version: str | None = None
         self.costs = CostTracker(settings.max_cost_usd)
         self._client = httpx.Client(
             base_url=settings.base_url,

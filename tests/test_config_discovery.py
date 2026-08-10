@@ -49,6 +49,38 @@ def test_settings_require_secret() -> None:
         Settings.from_sources({}, {})
 
 
+def test_agentbridge_settings_need_no_openrouter_key_and_use_codex_defaults() -> None:
+    settings = Settings.from_sources({"backend": "agentbridge"}, {})
+
+    assert settings.api_key == ""
+    assert settings.base_url == "http://127.0.0.1:8082/api/v1"
+    assert settings.image_model == "codex/gpt-5.6-sol"
+    assert settings.review_model == "codex/gpt-5.6-sol"
+    assert settings.agentbridge_timeout == 660
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"backend": "agentbridge", "base_url": "https://bridge.example/api/v1"},
+            "loopback",
+        ),
+        ({"backend": "agentbridge", "max_cost_usd": "1"}, "max-cost-usd"),
+        ({"backend": "agentbridge", "zdr": True}, "zdr"),
+        (
+            {"backend": "agentbridge", "image_model": "openai/gpt-image-2"},
+            "codex/",
+        ),
+    ],
+)
+def test_agentbridge_settings_reject_incompatible_options(
+    overrides: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ConfigurationError, match=message):
+        Settings.from_sources(overrides, {})
+
+
 def test_discover_recursive_skips_outputs_and_symlinks(tmp_path: Path) -> None:
     nested = tmp_path / "nested"
     nested.mkdir()

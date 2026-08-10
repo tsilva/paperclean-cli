@@ -85,13 +85,19 @@ class DocumentReport:
     output: str
     source_sha256: str
     output_sha256: str | None
+    backend: Literal["openrouter", "agentbridge"]
+    billing_mode: Literal["openrouter_usd", "codex_subscription"]
     image_model: str
     review_enabled: bool
     review_model: str | None
     started_at: str
     finished_at: str | None = None
     pages: list[PageRecord] = field(default_factory=list)
-    cost_usd: float = 0.0
+    backend_version: str | None = None
+    cost_usd: float | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
     ambiguous_timeout_charges: int = 0
     removed_pdf_features: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)

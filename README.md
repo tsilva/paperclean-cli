@@ -9,10 +9,12 @@ photos and poor scans without silently accepting changed content. Give it a PDF,
 JPEG, PNG, or folder; it recreates each page, runs deterministic fidelity checks,
 and falls back to the original page when a candidate cannot be trusted.
 
-Complete page pixels are sent to OpenRouter and the selected model providers.
-Before paid work begins, PaperClean shows a live cost and credit preflight and
-asks for confirmation. Optional `--review` adds five-view multimodal fidelity
-review; it is disabled by default.
+Complete page pixels are sent through the configured backend: OpenRouter, or a
+loopback AgentBridge server backed by your authenticated Codex CLI. Before work
+begins, PaperClean shows a preflight and asks for confirmation. OpenRouter mode
+includes live cost and credit checks; AgentBridge mode shows model-call ceilings
+because Codex subscription USD usage is not exposed. Optional `--review` adds
+five-view multimodal fidelity review; it is disabled by default.
 
 ## Install
 
@@ -51,6 +53,17 @@ Run PaperClean from the directory containing your document:
 paperclean document.pdf
 ```
 
+To run generation and optional review through Codex instead, start the sibling
+AgentBridge checkout and select its backend. No OpenRouter key is needed:
+
+```bash
+cd ../agentbridge
+uv run agentbridge
+
+# In another terminal, from the directory containing the document:
+paperclean document.pdf --backend agentbridge --yes
+```
+
 ## Commands
 
 ```bash
@@ -58,6 +71,7 @@ paperclean document.pdf                         # clean one PDF
 paperclean photo.jpg                            # clean one JPEG or PNG
 paperclean scans/                               # recursively clean a directory
 paperclean document.pdf --review                # add five-view semantic review
+paperclean document.pdf --backend agentbridge   # use Codex through local AgentBridge
 paperclean document.pdf --max-attempts 3        # set generation attempts per page
 paperclean document.pdf --max-cost-usd 1.00     # set a soft observed-cost ceiling
 paperclean document.pdf --ocr-lang eng+por      # select Tesseract languages
@@ -80,7 +94,10 @@ CLI flags override environment variables, which override these defaults:
 
 | Environment variable | Default |
 | --- | --- |
+| `PAPERCLEAN_BACKEND` | `openrouter` |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` |
+| `PAPERCLEAN_AGENTBRIDGE_BASE_URL` | `http://127.0.0.1:8082/api/v1` |
+| `PAPERCLEAN_AGENTBRIDGE_TIMEOUT` | `660` |
 | `PAPERCLEAN_IMAGE_MODEL` | `openai/gpt-image-2` |
 | `PAPERCLEAN_REVIEW` | `false` |
 | `PAPERCLEAN_REVIEW_MODEL` | `openai/gpt-5.6-sol` |
@@ -90,9 +107,11 @@ CLI flags override environment variables, which override these defaults:
 | `PAPERCLEAN_MAX_COST_USD` | unset |
 | `PAPERCLEAN_ZDR` | `false` |
 
-`OPENROUTER_API_KEY` is required. PaperClean reads supported values from the
-process environment first, then user-level `.env` or Keyenv configuration,
-then repository-level configuration.
+`OPENROUTER_API_KEY` is required only for the default OpenRouter backend.
+AgentBridge defaults both models to `codex/gpt-5.6-sol`, requires a loopback URL,
+and does not support `--max-cost-usd` or `--zdr`. PaperClean reads supported
+values from the process environment first, then user-level `.env` or Keyenv
+configuration, then repository-level configuration.
 
 ## Notes
 
@@ -106,11 +125,20 @@ then repository-level configuration.
 - The cost preflight checks selected endpoints, live pricing, available credits,
   and the conservative recovery ceiling. `--yes` accepts the displayed
   preflight but never overrides insufficient known credits.
+- The AgentBridge preflight verifies Codex availability, authentication, native
+  image generation, strict JSON Schema output, and the selected model. It shows
+  conservative call counts and records observable orchestration tokens, but
+  does not invent a USD cost or Codex subscription balance.
 - `--max-cost-usd` is a soft ceiling. One completed request or an ambiguously
   billed timeout can exceed it.
 - `--zdr` works only when every selected model endpoint is listed by OpenRouter
   as zero-data-retention capable. Do not process documents whose external
   transmission is prohibited.
+- AgentBridge requests use `store: false`. Its strict Codex profile disables
+  execution tools, treats page pixels as untrusted data, validates the returned
+  raster, and removes request-scoped generated-image artifacts. Page pixels are
+  still transmitted to the Codex service; do not process documents whose
+  external transmission is prohibited.
 - PDF outputs keep searchable text streams beneath an opaque page overlay.
   Active content and attachments are removed; encrypted PDFs, unapplied
   redactions, XFA, JavaScript-driven forms, and calculation-driven forms are

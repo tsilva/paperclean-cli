@@ -8,7 +8,7 @@ import pytest
 
 from paperclean.cli import _confirm, _prepare_paths, build_parser, run
 from paperclean.errors import ConfigurationError, InputError
-from paperclean.preflight import CostProjection, WorkEstimate
+from paperclean.preflight import CostProjection, WorkEstimate, build_subscription_projection
 
 
 def _projection(
@@ -91,6 +91,28 @@ def test_disabled_review_tui_has_zero_reviews_and_generation_only_cost(capsys) -
     assert "disabled" in output
     assert "SEMANTIC REVIEW DISABLED" in output
     assert "$0.3447" in output
+
+
+def test_codex_subscription_preflight_reports_calls_without_inventing_usd(capsys) -> None:
+    projection = build_subscription_projection(
+        document_total=1,
+        page_total=2,
+        max_attempts=3,
+        image_model="codex/gpt-5.6-sol",
+        review_enabled=False,
+        review_model=None,
+        backend_version="0.1.9",
+    )
+
+    _confirm(projection, yes=True)
+
+    output = capsys.readouterr().out
+    assert "Codex-work preflight" in output
+    assert "Codex subscription" in output
+    assert "USD cost" in output
+    assert "unavailable" in output
+    assert "Model calls" in output
+    assert "Paid model calls" not in output
 
 
 def test_review_boolean_flags_override_in_both_directions() -> None:

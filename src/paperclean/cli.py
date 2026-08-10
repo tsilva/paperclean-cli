@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 from rich import box
 from rich.console import Console, Group, RenderableType
@@ -18,6 +19,7 @@ from rich.table import Table
 from rich.text import Text
 
 from paperclean import __version__
+from paperclean.agentbridge import AgentBridgeClient
 from paperclean.config import Settings
 from paperclean.discovery import OutputPaths, check_collision, discover, output_paths
 from paperclean.environment import (
@@ -27,7 +29,7 @@ from paperclean.environment import (
 )
 from paperclean.errors import (
     ConfigurationError,
-    GlobalOpenRouterError,
+    GlobalProviderError,
     InputError,
     OutputCollisionError,
     PaperCleanError,
@@ -36,6 +38,7 @@ from paperclean.openrouter import OpenRouterClient
 from paperclean.pdfs import page_count
 from paperclean.pipeline import clean_document, report_has_fallback, report_summary
 from paperclean.preflight import CostProjection
+from paperclean.providers import ModelClient
 from paperclean.validation import check_tesseract
 
 
@@ -53,14 +56,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-attempts", type=int, help="generation attempts per page (default: 3)"
     )
-    parser.add_argument("--image-model", help="OpenRouter image generation model")
+    parser.add_argument(
+        "--backend",
+        choices=("openrouter", "agentbridge"),
+        help="model backend (default: openrouter)",
+    )
+    parser.add_argument(
+        "--agentbridge-base-url",
+        help="loopback AgentBridge API base URL",
+    )
+    parser.add_argument(
+        "--agentbridge-timeout",
+        type=int,
+        help="AgentBridge request timeout in seconds",
+    )
+    parser.add_argument("--image-model", help="image generation or Codex orchestrator model")
     parser.add_argument(
         "--review",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="enable the five-view semantic fidelity review (default: disabled)",
     )
-    parser.add_argument("--review-model", help="OpenRouter multimodal review model")
+    parser.add_argument("--review-model", help="multimodal review model")
     parser.add_argument("--ocr-lang", help="Tesseract language(s), such as eng or eng+por")
     parser.add_argument("--max-cost-usd", help="soft observed OpenRouter cost ceiling")
     parser.add_argument("--zdr", action="store_true", default=None, help="require ZDR endpoints")
@@ -73,10 +90,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _settings(args: argparse.Namespace, relaunch_args: Sequence[str]) -> Settings:
     runtime = discover_runtime_environment()
-    if runtime.keyenv_manifest is not None:
+    backend = str(
+        args.backend or runtime.values.get("PAPERCLEAN_BACKEND", "openrouter")
+    ).strip().lower()
+    if args.agentbridge_base_url is not None and backend != "agentbridge":
+        raise ConfigurationError("--agentbridge-base-url requires --backend agentbridge")
+    if runtime.keyenv_manifest is not None and backend == "openrouter":
         relaunch_with_keyenv(runtime, relaunch_args)
     return Settings.from_sources(
         {
+            "backend": args.backend,
+            "base_url": args.agentbridge_base_url,
+            "agentbridge_timeout": args.agentbridge_timeout,
             "jobs": args.jobs,
             "max_attempts": args.max_attempts,
             "image_model": args.image_model,
@@ -134,7 +159,7 @@ def _confirm(projection: CostProjection, *, yes: bool) -> None:
     )
     available = projection.effective_available_usd
     required = projection.recovery_ceiling.cost_usd
-    insufficient = available is not None and available < required
+    insufficient = available is not None and required is not None and available < required
 
     facts = Table.grid(padding=(0, 2))
     facts.add_column(style="bold cyan", no_wrap=True)
@@ -171,26 +196,40 @@ def _confirm(projection: CostProjection, *, yes: bool) -> None:
     work.add_column("Recovery ceiling", justify="right", style="magenta")
     work.add_row("Image generations", *(str(item.generations) for item in scenarios))
     work.add_row("Fidelity reviews", *(str(item.reviews) for item in scenarios))
-    work.add_row("Paid model calls", *(str(item.paid_calls) for item in scenarios))
+    work.add_row(
+        "Paid model calls" if projection.billing_mode == "openrouter_usd" else "Model calls",
+        *(str(item.paid_calls) for item in scenarios),
+    )
     work.add_row(
         "Projected cost",
         *(_money(item.cost_usd) for item in scenarios),
         style="bold",
     )
 
-    key_balance = "unlimited" if projection.key_unlimited else _money(projection.key_remaining_usd)
     balances = Table.grid(padding=(0, 2))
     balances.add_column(style="dim", no_wrap=True)
     balances.add_column(justify="right")
-    balances.add_row("OpenRouter account", _money(projection.account_remaining_usd))
-    balances.add_row("Key limit remaining", key_balance)
-    balances.add_row("Soft cost limit", _money(projection.soft_limit_usd))
-
-    note = Text(
-        "Conservative projection · actual cost varies with image shape, tokens, "
-        "early rejection, provider pricing, and retries.",
-        style="dim",
-    )
+    if projection.billing_mode == "openrouter_usd":
+        key_balance = (
+            "unlimited" if projection.key_unlimited else _money(projection.key_remaining_usd)
+        )
+        balances.add_row("OpenRouter account", _money(projection.account_remaining_usd))
+        balances.add_row("Key limit remaining", key_balance)
+        balances.add_row("Soft cost limit", _money(projection.soft_limit_usd))
+        note = Text(
+            "Conservative projection · actual cost varies with image shape, tokens, "
+            "early rejection, provider pricing, and retries.",
+            style="dim",
+        )
+    else:
+        balances.add_row("Billing", "Codex subscription")
+        balances.add_row("USD cost", "unavailable")
+        balances.add_row("AgentBridge", projection.backend_version or "unknown version")
+        note = Text(
+            "AgentBridge reports Codex orchestration tokens, not image-generation "
+            "subscription consumption or a USD balance.",
+            style="dim",
+        )
     status = (
         Text.assemble(
             ("INSUFFICIENT CREDITS  ", "bold white on red"),
@@ -204,7 +243,9 @@ def _confirm(projection: CostProjection, *, yes: bool) -> None:
         else Text("READY FOR CONFIRMATION", style="bold green")
     )
     soft_limit_warning = (
-        projection.soft_limit_usd is not None
+        projection.billing_mode == "openrouter_usd"
+        and projection.one_pass.cost_usd is not None
+        and projection.soft_limit_usd is not None
         and projection.soft_limit_usd < projection.one_pass.cost_usd
     )
     contents: list[RenderableType] = [facts, Text(), models]
@@ -235,7 +276,11 @@ def _confirm(projection: CostProjection, *, yes: bool) -> None:
     console.print(
         Panel(
             Group(*contents),
-            title="[bold cyan]PaperClean[/] · Paid-work preflight",
+            title=(
+                "[bold cyan]PaperClean[/] · Paid-work preflight"
+                if projection.billing_mode == "openrouter_usd"
+                else "[bold cyan]PaperClean[/] · Codex-work preflight"
+            ),
             border_style="cyan",
             padding=(1, 2),
         )
@@ -250,14 +295,19 @@ def _confirm(projection: CostProjection, *, yes: bool) -> None:
         return
     if not sys.stdin.isatty():
         raise ConfigurationError("confirmation is required; rerun with --yes")
-    if not Confirm.ask("Begin paid model calls?", default=False, console=console):
+    question = (
+        "Begin paid model calls?"
+        if projection.billing_mode == "openrouter_usd"
+        else "Begin Codex model calls?"
+    )
+    if not Confirm.ask(question, default=False, console=console):
         raise ConfigurationError("cancelled")
 
 
 def _process_documents(
     paths: list[OutputPaths],
     settings: Settings,
-    client: OpenRouterClient,
+    client: ModelClient,
     *,
     force: bool,
 ) -> tuple[list[object], BaseException | None]:
@@ -277,7 +327,7 @@ def _process_documents(
                 cursor += 1
             try:
                 reports[index] = clean_document(paths[index], settings, client, force=force)
-            except GlobalOpenRouterError as exc:
+            except GlobalProviderError as exc:
                 with cursor_lock:
                     if fatal is None:
                         fatal = exc
@@ -324,7 +374,13 @@ def run(argv: Sequence[str] | None = None) -> int:
         settings = _settings(args, relaunch_args)
         check_tesseract(settings.ocr_lang)
         pages = _count_pages(paths)
-        with OpenRouterClient(settings) as client:
+        raw_client = cast(
+            ModelClient,
+            AgentBridgeClient(settings)
+            if settings.backend == "agentbridge"
+            else OpenRouterClient(settings),
+        )
+        with raw_client as client:
             client.preflight()
             projection = client.cost_projection(
                 page_total=pages,

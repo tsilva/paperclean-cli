@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add an AgentBridge backend that runs generation and optional structured
+  five-view review through an authenticated local Codex CLI. Include capability
+  preflight, non-persistent requests, subscription call-count projections,
+  observable token accounting, and backend-aware provenance.
 - Add a modern terminal paid-work preflight with live provider pricing,
   projected calls and costs, recovery-ceiling balance enforcement, and
   interactive acceptance. Payment failures retain safe, actionable billing

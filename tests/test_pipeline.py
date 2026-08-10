@@ -68,7 +68,9 @@ def test_clean_image_accepts_only_after_five_reviews_when_enabled(
         force=False,
     )  # type: ignore[arg-type]
     assert report.pages[0].status == "model_generated_clean"
-    assert report.schema_version == 2
+    assert report.schema_version == 3
+    assert report.backend == "openrouter"
+    assert report.billing_mode == "openrouter_usd"
     assert report.review_enabled is True
     assert report.review_model == "openai/gpt-5.6-sol"
     assert client.review_calls == 5
@@ -91,13 +93,15 @@ def test_clean_image_default_skips_review_and_marks_provenance(tmp_path: Path, m
     report = clean_image(paths, Settings(api_key="fake"), client, force=False)  # type: ignore[arg-type]
 
     assert client.review_calls == 0
-    assert report.schema_version == 2
+    assert report.schema_version == 3
     assert report.review_enabled is False
     assert report.review_model is None
     assert report.pages[0].status == "model_generated_unreviewed"
     embedded = extract_png(paths.output.read_bytes())
     assert embedded is not None
-    assert embedded["payload"]["schema_version"] == 2
+    assert embedded["payload"]["schema_version"] == 3
+    assert embedded["payload"]["backend"] == "openrouter"
+    assert embedded["payload"]["billing_mode"] == "openrouter_usd"
     assert embedded["payload"]["review_enabled"] is False
     assert embedded["payload"]["models"]["review"] is None
     assert embedded["payload"]["pages"][0]["status"] == "model_generated_unreviewed"
@@ -110,6 +114,36 @@ def test_clean_image_default_skips_review_and_marks_provenance(tmp_path: Path, m
         "generated_pages": 1,
         "fallback_pages": 0,
     }
+
+
+def test_clean_image_records_agentbridge_subscription_provenance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    client = FakeClient()
+    paths = output_paths(source)
+    settings = Settings(
+        api_key="",
+        backend="agentbridge",
+        base_url="http://127.0.0.1:8082/api/v1",
+        image_model="codex/gpt-5.6-sol",
+        review_model="codex/gpt-5.6-sol",
+    )
+
+    report = clean_image(paths, settings, client, force=False)  # type: ignore[arg-type]
+
+    assert report.backend == "agentbridge"
+    assert report.billing_mode == "codex_subscription"
+    assert report.cost_usd is None
+    sidecar = json.loads(paths.report.read_text())
+    assert sidecar["backend"] == "agentbridge"
+    assert sidecar["billing_mode"] == "codex_subscription"
+    assert sidecar["cost_usd"] is None
 
 
 def test_low_resolution_generation_is_upscaled_to_source_resolution_output(

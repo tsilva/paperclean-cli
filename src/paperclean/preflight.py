@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 from paperclean.errors import GlobalOpenRouterError
 
@@ -40,7 +40,7 @@ class UnitPrices:
 class WorkEstimate:
     generations: int
     reviews: int
-    cost_usd: Decimal
+    cost_usd: Decimal | None
 
     @property
     def paid_calls(self) -> int:
@@ -64,6 +64,8 @@ class CostProjection:
     key_remaining_usd: Decimal | None
     key_unlimited: bool
     soft_limit_usd: Decimal | None
+    billing_mode: Literal["openrouter_usd", "codex_subscription"] = "openrouter_usd"
+    backend_version: str | None = None
 
     @property
     def effective_available_usd(self) -> Decimal | None:
@@ -73,6 +75,48 @@ class CostProjection:
             if value is not None
         ]
         return min(values) if values else None
+
+
+def build_subscription_projection(
+    *,
+    document_total: int,
+    page_total: int,
+    max_attempts: int,
+    image_model: str,
+    review_enabled: bool,
+    review_model: str | None,
+    backend_version: str | None,
+) -> CostProjection:
+    """Build call-count projections when Codex subscription pricing is unavailable."""
+
+    def estimate(generations: int, reviews: int) -> WorkEstimate:
+        return WorkEstimate(generations=generations, reviews=reviews, cost_usd=None)
+
+    configured_pages = page_total * max_attempts
+    review_multiplier = REVIEW_VIEWS_PER_ATTEMPT if review_enabled else 0
+    recovery_review_multiplier = REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT if review_enabled else 0
+    return CostProjection(
+        document_total=document_total,
+        page_total=page_total,
+        max_attempts=max_attempts,
+        image_model=image_model,
+        image_provider="Codex via AgentBridge",
+        review_enabled=review_enabled,
+        review_model=review_model if review_enabled else None,
+        review_provider="Codex via AgentBridge" if review_enabled else None,
+        one_pass=estimate(page_total, page_total * review_multiplier),
+        configured_max=estimate(configured_pages, configured_pages * review_multiplier),
+        recovery_ceiling=estimate(
+            configured_pages * GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT,
+            configured_pages * recovery_review_multiplier,
+        ),
+        account_remaining_usd=None,
+        key_remaining_usd=None,
+        key_unlimited=False,
+        soft_limit_usd=None,
+        billing_mode="codex_subscription",
+        backend_version=backend_version,
+    )
 
 
 def _price(value: Any) -> Decimal | None:
