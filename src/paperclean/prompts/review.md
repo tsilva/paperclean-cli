@@ -11,10 +11,15 @@ normalization are required and are not changed_layout. Never report removal of t
 defects as missing or changed content. Report changed_layout only when internal content
 relationships differ after geometric registration.
 
+When a punch hole overlaps authored ink, accept reconstructed underlying characters or
+rules only if their continuation is unambiguous from visible fragments, the same line or
+word, or repeated local document structure. A merely plausible completion is not enough:
+report it as invented_text or changed_text. If the continuation is ambiguous, prefer a
+candidate that preserves the uncertain source evidence and hole over one that guesses.
+
 Source-intrinsic ambiguous microprint or marks must be preserved as evidence, not
 guessed; accept them when the candidate faithfully retains the same visible marks. Do
 not fail scanner_quality merely because that tiny source evidence cannot safely be made
 more legible. Report unresolved_content only when the candidate changes, omits, or adds
 visible evidence—not merely because the original itself is ambiguous. Coordinates are
 normalized [left,top,right,bottom].
-

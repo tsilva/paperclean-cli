@@ -277,8 +277,8 @@ def test_cost_projection_uses_selected_endpoint_prices_and_credit_balances() -> 
     assert projection.one_pass.paid_calls == 6
     assert projection.one_pass.cost_usd == Decimal("1.189452")
     assert projection.configured_max.cost_usd == Decimal("3.568356")
-    assert projection.recovery_ceiling.paid_calls == 69
-    assert projection.recovery_ceiling.cost_usd == Decimal("13.239468")
+    assert projection.recovery_ceiling.paid_calls == 371
+    assert projection.recovery_ceiling.cost_usd == Decimal("64.616772")
     assert projection.account_remaining_usd == Decimal("0.718589992")
     assert projection.key_remaining_usd == Decimal("10")
 

@@ -4,14 +4,16 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from paperclean.config import Settings
 from paperclean.discovery import output_paths
-from paperclean.errors import ReviewerResponseError
+from paperclean.errors import ProviderError, ReviewerResponseError
 from paperclean.models import Discrepancy, ReviewVerdict
 from paperclean.openrouter import CostTracker
 from paperclean.pipeline import GENERATION_PROMPT, clean_image, report_has_fallback, report_summary
+from paperclean.prompting import PUNCH_HOLE_REPAIR_PROMPT
 from paperclean.provenance import extract_png
 from paperclean.validation import DeterministicResult
 
@@ -69,7 +71,7 @@ def test_clean_image_accepts_only_after_five_model_verifications(
         force=False,
     )  # type: ignore[arg-type]
     assert report.pages[0].status == "model_generated_clean"
-    assert report.schema_version == 4
+    assert report.schema_version == 6
     assert report.backend == "openrouter"
     assert report.billing_mode == "openrouter_usd"
     assert report.verification_model == "openai/gpt-5.6-sol"
@@ -77,7 +79,7 @@ def test_clean_image_accepts_only_after_five_model_verifications(
     assert client.review_calls == 5
     embedded = extract_png(paths.output.read_bytes())
     assert embedded is not None
-    assert embedded["payload"]["schema_version"] == 4
+    assert embedded["payload"]["schema_version"] == 6
     assert embedded["payload"]["models"]["verification"] == "openai/gpt-5.6-sol"
     assert embedded["payload"]["verification"]["strategy"] == report.verification_strategy
     assert embedded["payload"]["pages"][0]["status"] == "model_generated_clean"
@@ -197,9 +199,568 @@ def test_invalid_verification_never_accepts_a_generated_page(tmp_path: Path, mon
         force=False,
     )  # type: ignore[arg-type]
 
-    assert client.review_calls == 2
+    assert client.review_calls == 4
     assert report.pages[0].status == "original_fallback"
     assert report.pages[0].fallback_reason == "provider_or_review_error"
+    assert [attempt.strategy for attempt in report.pages[0].attempts] == [
+        "model_generation",
+        "source_preserving_cleanup",
+    ]
+
+
+def test_source_preserving_cleanup_recovers_after_transient_reviewer_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class TransientReviewerErrorClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                raise ReviewerResponseError("transient invalid structured verdict")
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = TransientReviewerErrorClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    page = report.pages[0]
+    assert client.review_calls == 7
+    assert page.status == "source_preserving_clean"
+    assert [attempt.strategy for attempt in page.attempts] == [
+        "model_generation",
+        "source_preserving_cleanup",
+    ]
+    assert page.attempts[-1].accepted is True
+
+
+def test_page_review_retries_one_transient_timeout(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class TimeoutThenPassClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls == 1:
+                raise ProviderError("transient timeout", error_type="timeout_error")
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = TimeoutThenPassClient()
+    paths = output_paths(source)
+    report = clean_image(paths, Settings(api_key="fake"), client, force=False)  # type: ignore[arg-type]
+
+    assert client.review_calls == 6
+    assert report.pages[0].status == "model_generated_clean"
+
+
+def test_transient_quality_only_rejection_is_confirmed(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class FlakyQualityClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls == 1:
+                return ReviewVerdict(
+                    content_match=True,
+                    scanner_quality=False,
+                    discrepancies=[Discrepancy("scanner_quality", "high", (0.0, 0.0, 1.0, 1.0))],
+                )
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = FlakyQualityClient()
+    paths = output_paths(source)
+    report = clean_image(paths, Settings(api_key="fake"), client, force=False)  # type: ignore[arg-type]
+
+    assert client.review_calls == 6
+    assert report.pages[0].status == "model_generated_clean"
+
+
+def test_confirmed_quality_only_rejection_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class PoorQualityClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            return ReviewVerdict(content_match=True, scanner_quality=False)
+
+    client = PoorQualityClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    assert client.review_calls == 4
+    assert report.pages[0].status == "original_fallback"
+    assert report.pages[0].attempts[0].verification_categories == ["scanner_quality"]
+    assert report.pages[0].attempts[1].strategy == "source_preserving_cleanup"
+
+
+def test_source_preserving_cleanup_recovers_after_model_attempts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class SourceRecoveryClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = SourceRecoveryClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    page = report.pages[0]
+    assert client.review_calls == 7
+    assert page.status == "source_preserving_clean"
+    assert [attempt.strategy for attempt in page.attempts] == [
+        "model_generation",
+        "source_preserving_cleanup",
+    ]
+    assert page.attempts[-1].accepted is True
+    assert report_has_fallback(report) is False
+
+
+def test_high_confidence_authored_hole_repair_is_published(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.authored_punch_hole_regions",
+        lambda _source: [(0.0, 0.3, 0.3, 0.4)],
+    )
+    repair_prompts: list[str] = []
+
+    def repair(_source, candidate, *_args, **kwargs):
+        repair_prompts.append(kwargs["prompt"])
+        return candidate
+
+    monkeypatch.setattr("paperclean.pipeline.repair_region", repair)
+
+    class VerifiedRepairClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = VerifiedRepairClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    page = report.pages[0]
+    assert client.review_calls == 7
+    assert page.status == "model_assisted_clean"
+    assert [attempt.strategy for attempt in page.attempts] == [
+        "model_generation",
+        "model_assisted_source_cleanup",
+    ]
+    assert repair_prompts == [PUNCH_HOLE_REPAIR_PROMPT]
+    assert page.attempts[-1].accepted is True
+
+
+@pytest.mark.parametrize("category", ["changed_text", "unresolved_content", "other_content"])
+def test_uncertain_authored_hole_repair_keeps_the_source_hole(
+    tmp_path: Path, monkeypatch, category: str
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.authored_punch_hole_regions",
+        lambda _source: [(0.0, 0.3, 0.3, 0.4)],
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.repair_region",
+        lambda _source, candidate, *_args, **_kwargs: candidate,
+    )
+
+    class UncertainRepairClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            if self.review_calls <= 4:
+                return ReviewVerdict(
+                    content_match=False,
+                    scanner_quality=True,
+                    discrepancies=[Discrepancy(category, "high", (0.0, 0.0, 0.3, 0.4))],
+                )
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = UncertainRepairClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    page = report.pages[0]
+    assert client.review_calls == 9
+    assert page.status == "source_preserving_clean"
+    assert [attempt.strategy for attempt in page.attempts] == [
+        "model_generation",
+        "model_assisted_source_cleanup",
+        "source_preserving_cleanup",
+    ]
+    assert page.attempts[-2].accepted is False
+    assert page.attempts[-1].accepted is True
+
+
+def test_source_cleanup_records_confirmed_quality_limitations(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class LowQualityClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            if self.review_calls <= 4:
+                return ReviewVerdict(
+                    content_match=True,
+                    scanner_quality=False,
+                    discrepancies=[Discrepancy("scanner_quality", "high", (0.0, 0.0, 1.0, 1.0))],
+                )
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = LowQualityClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    page = report.pages[0]
+    assert client.review_calls == 8
+    assert page.status == "source_preserving_clean"
+    assert page.attempts[-1].accepted is True
+    assert page.attempts[-1].verification_categories == ["scanner_quality"]
+
+
+def test_source_cleanup_tolerates_only_expected_layout_rectification(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class RectifiedLayoutClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            return ReviewVerdict(
+                content_match=False,
+                scanner_quality=True,
+                discrepancies=[Discrepancy("changed_layout", "medium", (0.0, 0.0, 1.0, 1.0))],
+            )
+
+    client = RectifiedLayoutClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    assert client.review_calls == 12
+    assert report.pages[0].status == "source_preserving_clean"
+    assert report.pages[0].attempts[-1].verification_categories == ["changed_layout"]
+
+
+def test_source_cleanup_tolerates_changed_diagram_only_for_preserved_photographic_regions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.has_preserved_photographic_regions",
+        lambda _source: True,
+    )
+
+    class PreservedPhotoClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            return ReviewVerdict(
+                content_match=False,
+                scanner_quality=True,
+                discrepancies=[Discrepancy("changed_diagram", "high", (0.1, 0.1, 0.9, 0.9))],
+            )
+
+    client = PreservedPhotoClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    assert client.review_calls == 12
+    assert report.pages[0].status == "source_preserving_clean"
+    assert report.pages[0].attempts[-1].verification_categories == ["changed_diagram"]
+
+
+@pytest.mark.parametrize("category", ["other_content", "unresolved_content"])
+def test_source_cleanup_records_confirmed_non_specific_alerts(
+    tmp_path: Path, monkeypatch, category: str
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class NonSpecificAlertClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            return ReviewVerdict(
+                content_match=False,
+                scanner_quality=True,
+                discrepancies=[Discrepancy(category, "high", (0.0, 0.0, 1.0, 1.0))],
+            )
+
+    client = NonSpecificAlertClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    assert client.review_calls == 12
+    assert report.pages[0].status == "source_preserving_clean"
+    assert report.pages[0].attempts[-1].verification_categories == [category]
+
+
+def test_source_cleanup_confirms_transient_content_rejection(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class TransientContentClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            if self.review_calls == 3:
+                return ReviewVerdict(
+                    content_match=False,
+                    scanner_quality=True,
+                    discrepancies=[Discrepancy("changed_table", "high", (0.1, 0.1, 0.9, 0.9))],
+                )
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = TransientContentClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    assert client.review_calls == 8
+    assert report.pages[0].status == "source_preserving_clean"
+    assert report.pages[0].attempts[-1].accepted is True
+
+
+def test_source_cleanup_records_each_boolean_only_rejection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class RegionalBooleanClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            if self.review_calls <= 4:
+                return ReviewVerdict(
+                    content_match=False,
+                    scanner_quality=True,
+                    discrepancies=[
+                        Discrepancy("changed_layout", "medium", (0.0, 0.0, 1.0, 1.0))
+                    ],
+                )
+            if self.review_calls <= 6:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = RegionalBooleanClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    assert client.review_calls == 6
+    assert report.pages[0].status == "original_fallback"
+    assert report.pages[0].attempts[-1].verification_categories == [
+        "changed_layout",
+        "scanner_quality",
+    ]
+
+
+def test_source_cleanup_restores_flagged_source_evidence_and_rechecks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    restored_regions: list[list[tuple[float, float, float, float]]] = []
+
+    def restore(
+        _source: Image.Image,
+        candidate: Image.Image,
+        regions: list[tuple[float, float, float, float]],
+    ) -> Image.Image:
+        restored_regions.append(regions)
+        return candidate
+
+    monkeypatch.setattr("paperclean.pipeline.restore_source_evidence_regions", restore)
+
+    class MissingEvidenceClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            if self.review_calls <= 4:
+                return ReviewVerdict(
+                    content_match=False,
+                    scanner_quality=True,
+                    discrepancies=[
+                        Discrepancy("changed_text", "high", (0.2, 0.3, 0.8, 0.4))
+                    ],
+                )
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = MissingEvidenceClient()
+    paths = output_paths(source)
+    report = clean_image(
+        paths,
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    assert restored_regions == [[(0.2, 0.3, 0.8, 0.4)]]
+    assert client.review_calls == 9
+    assert report.pages[0].status == "source_preserving_clean"
+    assert report.pages[0].attempts[-1].accepted is True
 
 
 def test_review_rejection_can_be_repaired_and_rechecked(tmp_path: Path, monkeypatch) -> None:
@@ -228,7 +789,7 @@ def test_review_rejection_can_be_repaired_and_rechecked(tmp_path: Path, monkeypa
                 return ReviewVerdict(
                     content_match=False,
                     scanner_quality=True,
-                    discrepancies=[Discrepancy("changed_text", "high", (0.4, 0.4, 0.6, 0.5))],
+                    discrepancies=[Discrepancy("other_content", "high", (0.4, 0.4, 0.6, 0.5))],
                 )
             return ReviewVerdict(content_match=True, scanner_quality=True)
 
@@ -246,8 +807,9 @@ def test_review_rejection_can_be_repaired_and_rechecked(tmp_path: Path, monkeypa
     assert report.pages[0].status == "model_generated_clean"
 
 
+@pytest.mark.parametrize("category", ["missing_text", "changed_layout"])
 def test_edge_verification_rejection_restores_source_and_rechecks(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, category: str
 ) -> None:
     source = tmp_path / "scan.png"
     _write_png(source)
@@ -276,7 +838,7 @@ def test_edge_verification_rejection_restores_source_and_rechecks(
                 return ReviewVerdict(
                     content_match=False,
                     scanner_quality=True,
-                    discrepancies=[Discrepancy("missing_text", "high", (0.2, 0.96, 0.8, 0.99))],
+                    discrepancies=[Discrepancy(category, "high", (0.2, 0.96, 0.8, 0.99))],
                 )
             return ReviewVerdict(content_match=True, scanner_quality=True)
 
@@ -285,5 +847,46 @@ def test_edge_verification_rejection_restores_source_and_rechecks(
     report = clean_image(paths, Settings(api_key="fake"), client, force=False)  # type: ignore[arg-type]
 
     assert restored_regions == [[(0.0, 0.94, 1.0, 1.0)]]
+    assert client.review_calls == 6
+    assert report.pages[0].status == "model_generated_clean"
+
+
+def test_interior_content_rejection_restores_registered_source(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    restored_regions: list[list[tuple[float, float, float, float]]] = []
+
+    def restore(
+        _source: Image.Image,
+        candidate: Image.Image,
+        regions: list[tuple[float, float, float, float]],
+    ) -> Image.Image:
+        restored_regions.append(regions)
+        return candidate
+
+    monkeypatch.setattr("paperclean.pipeline.restore_source_regions", restore)
+
+    class TableClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls == 1:
+                return ReviewVerdict(
+                    content_match=False,
+                    scanner_quality=True,
+                    discrepancies=[Discrepancy("changed_table", "high", (0.2, 0.3, 0.8, 0.7))],
+                )
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = TableClient()
+    paths = output_paths(source)
+    report = clean_image(paths, Settings(api_key="fake"), client, force=False)  # type: ignore[arg-type]
+
+    assert restored_regions == [[(0.2, 0.3, 0.8, 0.7)]]
     assert client.review_calls == 6
     assert report.pages[0].status == "model_generated_clean"

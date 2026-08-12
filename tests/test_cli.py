@@ -11,7 +11,7 @@ from paperclean.errors import ConfigurationError, InputError
 from paperclean.preflight import CostProjection, WorkEstimate, build_subscription_projection
 
 
-def _projection(*, account_remaining: Decimal = Decimal("20")) -> CostProjection:
+def _projection(*, account_remaining: Decimal = Decimal("40")) -> CostProjection:
     review_count = 5
     return CostProjection(
         document_total=1,
@@ -23,9 +23,9 @@ def _projection(*, account_remaining: Decimal = Decimal("20")) -> CostProjection
         review_provider="OpenAI",
         one_pass=WorkEstimate(1, review_count, Decimal("1.189452")),
         configured_max=WorkEstimate(3, review_count * 3, Decimal("3.568356")),
-        recovery_ceiling=WorkEstimate(9, review_count * 12, Decimal("13.239468")),
+        recovery_ceiling=WorkEstimate(11, review_count * 32, Decimal("30.824772")),
         account_remaining_usd=account_remaining,
-        key_remaining_usd=Decimal("20"),
+        key_remaining_usd=Decimal("40"),
         key_unlimited=False,
         soft_limit_usd=None,
     )
@@ -48,7 +48,7 @@ def test_preflight_prints_work_costs_and_low_balance_warning(capsys) -> None:
     assert "Fidelity verifications" in output
     assert "Paid model calls" in output
     assert "$1.1895" in output
-    assert "$20.0000" in output
+    assert "$40.0000" in output
     assert "READY FOR CONFIRMATION" in output
     assert "╭" in output
 
@@ -63,7 +63,7 @@ def test_balance_covering_one_pass_but_not_recovery_stops_even_with_yes(capsys) 
     assert "INSUFFICIENT CREDITS" in output
     assert "$2.0000" in output
     assert "$1.1895" in output
-    assert "$13.2395" in output
+    assert "$30.8248" in output
     assert "required" in output
     assert "recovery" in output
     assert "ceiling" in output

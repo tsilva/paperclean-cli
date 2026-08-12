@@ -13,9 +13,23 @@ REVIEW_VIEWS_PER_ATTEMPT = 5
 
 # A full-page generation can be retried once with a smaller reference image, and
 # one regional repair generation can follow a failed verification. Each verdict
-# can be retried once, and a repaired candidate must pass a second complete review.
+# can be retried once, quality-only rejections are confirmed once, and a repaired
+# candidate must pass a second complete review.
+REVIEW_TIMEOUT_ATTEMPTS = 2
 GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT = 3
-REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT = REVIEW_VIEWS_PER_ATTEMPT * 2 * 2
+REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT = (
+    REVIEW_VIEWS_PER_ATTEMPT * 2 * 2 * 2 * REVIEW_TIMEOUT_ATTEMPTS
+)
+# A final source-preserving candidate can be schema-retried and quality-confirmed,
+# then rechecked once after localized source-evidence restoration.
+SOURCE_CLEANUP_REVIEW_REQUESTS_PER_PAGE = (
+    REVIEW_VIEWS_PER_ATTEMPT * 2 * 2 * REVIEW_TIMEOUT_ATTEMPTS * 2
+)
+# Up to two authored-hole crops may be regenerated, then independently verified.
+SOURCE_ASSISTED_GENERATION_REQUESTS_PER_PAGE = 2
+SOURCE_ASSISTED_REVIEW_REQUESTS_PER_PAGE = (
+    REVIEW_VIEWS_PER_ATTEMPT * 2 * 2 * REVIEW_TIMEOUT_ATTEMPTS
+)
 
 # Conservative token assumptions based on the maximum image sizes PaperClean
 # sends and high-quality GPT Image output. They deliberately favor overestimation.
@@ -106,8 +120,14 @@ def build_subscription_projection(
             configured_pages * REVIEW_VIEWS_PER_ATTEMPT,
         ),
         recovery_ceiling=estimate(
-            configured_pages * GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT,
-            configured_pages * REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT,
+            configured_pages * GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT
+            + page_total * SOURCE_ASSISTED_GENERATION_REQUESTS_PER_PAGE,
+            configured_pages * REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT
+            + page_total
+            * (
+                SOURCE_ASSISTED_REVIEW_REQUESTS_PER_PAGE
+                + SOURCE_CLEANUP_REVIEW_REQUESTS_PER_PAGE
+            ),
         ),
         account_remaining_usd=None,
         key_remaining_usd=None,
@@ -218,8 +238,14 @@ def build_cost_projection(
             configured_pages * REVIEW_VIEWS_PER_ATTEMPT,
         ),
         recovery_ceiling=estimate(
-            configured_pages * GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT,
-            configured_pages * REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT,
+            configured_pages * GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT
+            + page_total * SOURCE_ASSISTED_GENERATION_REQUESTS_PER_PAGE,
+            configured_pages * REVIEW_REQUESTS_PER_RECOVERY_ATTEMPT
+            + page_total
+            * (
+                SOURCE_ASSISTED_REVIEW_REQUESTS_PER_PAGE
+                + SOURCE_CLEANUP_REVIEW_REQUESTS_PER_PAGE
+            ),
         ),
         account_remaining_usd=account_remaining_usd,
         key_remaining_usd=key_remaining_usd,

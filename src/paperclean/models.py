@@ -7,7 +7,14 @@ from typing import Any, Literal
 
 PageStatus = Literal[
     "model_generated_clean",
+    "model_assisted_clean",
+    "source_preserving_clean",
     "original_fallback",
+]
+AttemptStrategy = Literal[
+    "model_generation",
+    "model_assisted_source_cleanup",
+    "source_preserving_cleanup",
 ]
 DiscrepancyCategory = Literal[
     "changed_text",
@@ -57,6 +64,7 @@ class ReviewVerdict:
 @dataclass(slots=True)
 class AttemptRecord:
     number: int
+    strategy: AttemptStrategy = "model_generation"
     local_issues: list[str] = field(default_factory=list)
     verification_categories: list[str] = field(default_factory=list)
     generated_width: int | None = None

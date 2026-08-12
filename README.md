@@ -116,9 +116,27 @@ configuration, then repository-level configuration.
   does not follow directory symlinks.
 - Local registration, foreground, canvas, and resolution checks run before mandatory
   five-view model verification. Rejected candidates retry with feedback, then fall
-  back to the original page when attempts are exhausted.
-- PaperClean restores registered signatures, stamps, and reviewer-identified edge
-  content from the source without restoring stains, skew, shadows, or damaged edges.
+  back to a source-preserving white-paper cleanup that must pass the same verification.
+  A page-scoped review timeout is retried exactly once before that attempt fails closed.
+  That recovery confirms every rejection once and records residual quality limitations
+  plus expected global deskew/layout rectification in legacy pages. Confirmed non-specific
+  alerts are recorded but do not veto a deterministic candidate. Explicit missing,
+  cropped, invented, text, table, and diagram discrepancies still fail closed; localized
+  normalized source evidence is restored for text-like discrepancies and the candidate is
+  reviewed again. The untouched original page is used only if recovery still fails.
+- PaperClean restores registered reviewer-identified text, tables, diagrams, layout,
+  signatures, stamps, and edge content from cleaned source pixels without restoring
+  stains, skew, shadows, or damaged edges. Large photographic and diagnostic-image
+  panels and large shaded form regions remain pixel-exact while the surrounding scanned
+  paper is cleaned, even when thin scan noise connects a panel to a page border. A binder
+  hole and its halo are erased
+  directly only when their surrounding context is blank. When a hole obscures
+  authored ink, PaperClean attempts a localized model restoration only when the obscured
+  continuation is highly probable and publishes it only after independent full-page and
+  regional verification. Vague unresolved-content alerts reject assisted restoration;
+  otherwise the original hole is retained instead of guessing.
+  A `changed_diagram` review alert is tolerable only when the local detector confirms
+  that large photographic panels were masked and preserved by this deterministic path.
 - The cost preflight checks selected endpoints, live pricing, available credits,
   and the conservative recovery ceiling. `--yes` accepts the displayed
   preflight but never overrides insufficient known credits.

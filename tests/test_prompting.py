@@ -5,6 +5,7 @@ import pytest
 from paperclean.prompting import (
     FEEDBACK_TEMPLATE,
     GENERATION_PROMPT,
+    PUNCH_HOLE_REPAIR_PROMPT,
     REGIONAL_REPAIR_PROMPT,
     REVIEW_PROMPT,
     REVIEW_SYSTEM_PROMPT,
@@ -14,10 +15,17 @@ from paperclean.prompting import (
 
 def test_all_primary_prompts_load_from_packaged_markdown() -> None:
     assert load_prompt("generation.md") == GENERATION_PROMPT
+    assert load_prompt("punch-hole-repair.md") == PUNCH_HOLE_REPAIR_PROMPT
     assert load_prompt("regional-repair.md") == REGIONAL_REPAIR_PROMPT
     assert load_prompt("review.md") == REVIEW_PROMPT
     assert load_prompt("review-system.md") == REVIEW_SYSTEM_PROMPT
     assert load_prompt("feedback.md") == FEEDBACK_TEMPLATE
+
+
+def test_review_prompt_requires_unambiguous_punch_hole_reconstruction() -> None:
+    assert "punch hole overlaps authored ink" in REVIEW_PROMPT
+    assert "merely plausible completion is not enough" in REVIEW_PROMPT
+    assert "preserves the uncertain source evidence" in REVIEW_PROMPT
 
 
 @pytest.mark.parametrize(

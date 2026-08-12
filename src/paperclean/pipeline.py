@@ -29,18 +29,33 @@ from paperclean.imaging import (
     review_boxes,
     source_dpi,
 )
-from paperclean.models import AttemptRecord, Discrepancy, DocumentReport, PageRecord
+from paperclean.models import (
+    AttemptRecord,
+    Discrepancy,
+    DocumentReport,
+    PageRecord,
+    ReviewVerdict,
+)
 from paperclean.pdfs import build_pdf, inspect_pdf, render_overlay_preview, render_pages
-from paperclean.prompting import FEEDBACK_TEMPLATE, GENERATION_PROMPT, load_prompt
+from paperclean.prompting import (
+    FEEDBACK_TEMPLATE,
+    GENERATION_PROMPT,
+    PUNCH_HOLE_REPAIR_PROMPT,
+    load_prompt,
+)
 from paperclean.provenance import embed_image, manifest_wrapper, write_report
 from paperclean.providers import ModelClient
 from paperclean.restoration import (
+    authored_punch_hole_regions,
     best_repair_region,
     clear_page_border,
+    has_preserved_photographic_regions,
     registered_review_pairs,
     repair_region,
     rescue_colored_marks,
+    restore_source_evidence_regions,
     restore_source_regions,
+    source_preserving_cleanup,
 )
 from paperclean.util import (
     private_workdir,
@@ -84,29 +99,72 @@ def _feedback(categories: list[str]) -> str:
 VERIFICATION_STRATEGY = "full-page-plus-four-registered-regions"
 
 
+def _review_view(
+    client: ModelClient,
+    source: Image.Image,
+    candidate: Image.Image,
+    *,
+    view_name: str,
+) -> ReviewVerdict:
+    for timeout_attempt in range(2):
+        try:
+            for schema_attempt in range(2):
+                try:
+                    return client.review(source, candidate, view_name=view_name)
+                except ReviewerResponseError:
+                    if schema_attempt:
+                        raise
+        except ProviderError as exc:
+            if exc.error_type not in {"timeout", "timeout_error"} or timeout_attempt:
+                raise
+    raise ReviewerResponseError("reviewer did not produce a verdict")
+
+
+def _quality_only_rejection(verdict: ReviewVerdict) -> bool:
+    return (
+        not verdict.accepted
+        and verdict.content_match
+        and all(item.category == "scanner_quality" for item in verdict.discrepancies)
+    )
+
+
 def _verification_accepts(
     client: ModelClient,
     source: Image.Image,
     candidate: Image.Image,
+    *,
+    tolerated_categories: frozenset[str] = frozenset(),
+    confirm_rejections: bool = False,
 ) -> tuple[bool, list[Discrepancy]]:
     discrepancies: list[Discrepancy] = []
     for index, (source_view, candidate_view) in enumerate(
         registered_review_pairs(source, candidate)
     ):
-        verdict = None
-        for schema_attempt in range(2):
-            try:
-                verdict = client.review(
-                    source_view,
-                    candidate_view,
-                    view_name="full page" if index == 0 else f"region {index} of 4",
-                )
-                break
-            except ReviewerResponseError:
-                if schema_attempt:
-                    raise
-        if verdict is None:
-            raise ReviewerResponseError("reviewer did not produce a verdict")
+        view_name = "full page" if index == 0 else f"region {index} of 4"
+        verdict = _review_view(
+            client,
+            source_view,
+            candidate_view,
+            view_name=view_name,
+        )
+        if _quality_only_rejection(verdict) or (confirm_rejections and not verdict.accepted):
+            verdict = _review_view(
+                client,
+                source_view,
+                candidate_view,
+                view_name=view_name,
+            )
+        view_discrepancies = list(verdict.discrepancies)
+        if not verdict.content_match and not view_discrepancies:
+            view_discrepancies.append(
+                Discrepancy("unresolved_content", "high", (0.0, 0.0, 1.0, 1.0))
+            )
+        if not verdict.scanner_quality and not any(
+            item.category == "scanner_quality" for item in view_discrepancies
+        ):
+            view_discrepancies.append(
+                Discrepancy("scanner_quality", "high", (0.0, 0.0, 1.0, 1.0))
+            )
         view_box = (
             (0, 0, candidate.width, candidate.height)
             if index == 0
@@ -115,7 +173,7 @@ def _verification_accepts(
         view_left, view_top, view_right, view_bottom = view_box
         view_width = view_right - view_left
         view_height = view_bottom - view_top
-        for item in verdict.discrepancies:
+        for item in view_discrepancies:
             left, top, right, bottom = item.region
             discrepancies.append(
                 Discrepancy(
@@ -129,39 +187,60 @@ def _verification_accepts(
                     ),
                 )
             )
-        if not verdict.accepted:
-            if not verdict.content_match and not discrepancies:
-                discrepancies.append(
-                    Discrepancy("unresolved_content", "high", (0.0, 0.0, 1.0, 1.0))
-                )
-            if not verdict.scanner_quality:
-                discrepancies.append(Discrepancy("scanner_quality", "high", (0.0, 0.0, 1.0, 1.0)))
+        tolerated_transformation = (
+            bool(verdict.discrepancies)
+            and all(item.category in tolerated_categories for item in verdict.discrepancies)
+        )
+        if not verdict.accepted and not tolerated_transformation:
             return False, discrepancies
     return True, discrepancies
 
 
 _SOURCE_PRESERVED_CATEGORIES = {
+    "changed_diagram",
+    "changed_handwriting",
+    "changed_layout",
+    "changed_signature",
+    "changed_stamp",
+    "changed_redaction",
+    "changed_text",
+    "changed_table",
+    "cropped_content",
+    "invented_text",
+    "missing_text",
+    "unresolved_content",
+}
+
+_SOURCE_CLEANUP_TOLERATED_CATEGORIES = frozenset(
+    {
+        "changed_layout",
+        "other_content",
+        "scanner_quality",
+        "unresolved_content",
+    }
+)
+_MODEL_ASSISTED_CLEANUP_TOLERATED_CATEGORIES = frozenset(
+    {
+        "changed_layout",
+        "scanner_quality",
+    }
+)
+_MAX_AUTHORED_HOLE_REPAIRS = 2
+_SOURCE_EVIDENCE_RECOVERY_CATEGORIES = {
+    "changed_text",
+    "missing_text",
+    "invented_text",
     "changed_handwriting",
     "changed_signature",
     "changed_stamp",
     "changed_redaction",
-}
-_SOURCE_EDGE_CATEGORIES = {
-    "changed_text",
-    "missing_text",
-    "invented_text",
+    "changed_table",
     "cropped_content",
-    "unresolved_content",
 }
 
 
 def _preserve_from_source(discrepancy: Discrepancy) -> bool:
-    if discrepancy.category in _SOURCE_PRESERVED_CATEGORIES:
-        return True
-    if discrepancy.category not in _SOURCE_EDGE_CATEGORIES:
-        return False
-    left, top, right, bottom = discrepancy.region
-    return min(left, top) < 0.04 or max(right, bottom) > 0.94
+    return discrepancy.category in _SOURCE_PRESERVED_CATEGORIES
 
 
 def _source_region(discrepancy: Discrepancy) -> tuple[float, float, float, float]:
@@ -281,6 +360,183 @@ def process_page(
             # Page-scoped provider failures consume the attempt; auth/config errors
             # have already been normalized as GlobalProviderError and propagate.
             continue
+    if fallback_reason in {"attempts_exhausted", "provider_or_review_error"}:
+        cleanup_record: AttemptRecord | None = None
+        try:
+            recreation = source_preserving_cleanup(source)
+            candidate = finalize_candidate(recreation)
+            deterministic = validate_candidate(
+                source,
+                candidate,
+                min_effective_dpi=settings.min_effective_dpi,
+                effective_dpi=source_page_dpi,
+            )
+            if deterministic.accepted:
+                source_tolerated_categories = _SOURCE_CLEANUP_TOLERATED_CATEGORIES
+                assisted_tolerated_categories = _MODEL_ASSISTED_CLEANUP_TOLERATED_CATEGORIES
+                if has_preserved_photographic_regions(source):
+                    source_tolerated_categories = source_tolerated_categories | {
+                        "changed_diagram"
+                    }
+                    assisted_tolerated_categories = assisted_tolerated_categories | {
+                        "changed_diagram"
+                    }
+                hole_regions = authored_punch_hole_regions(source)[:_MAX_AUTHORED_HOLE_REPAIRS]
+                if hole_regions:
+                    assisted_record = AttemptRecord(
+                        number=len(attempts) + 1,
+                        strategy="model_assisted_source_cleanup",
+                        effective_dpi=round(source_page_dpi, 2),
+                    )
+                    attempts.append(assisted_record)
+                    try:
+                        assisted_recreation = recreation
+                        for hole_region in hole_regions:
+                            assisted_recreation = repair_region(
+                                source,
+                                assisted_recreation,
+                                hole_region,
+                                client=client,
+                                max_edge=settings.max_reference_edge,
+                                prompt=PUNCH_HOLE_REPAIR_PROMPT,
+                            )
+                        assisted_candidate = finalize_candidate(assisted_recreation)
+                        assisted_deterministic = validate_candidate(
+                            source,
+                            assisted_candidate,
+                            min_effective_dpi=settings.min_effective_dpi,
+                            effective_dpi=source_page_dpi,
+                        )
+                        assisted_record.local_issues = assisted_deterministic.issues
+                        if assisted_deterministic.accepted:
+                            assisted_accepted, assisted_discrepancies = _verification_accepts(
+                                client,
+                                source,
+                                assisted_candidate,
+                                tolerated_categories=assisted_tolerated_categories,
+                                confirm_rejections=True,
+                            )
+                            assisted_record.verification_categories = list(
+                                dict.fromkeys(
+                                    item.category for item in assisted_discrepancies
+                                )
+                            )
+                            assisted_record.accepted = assisted_accepted
+                            if assisted_accepted:
+                                return PageOutcome(
+                                    output_image=assisted_recreation,
+                                    record=PageRecord(
+                                        page=page_number,
+                                        status="model_assisted_clean",
+                                        source_render_sha256=source_hash,
+                                        final_render_sha256=pixel_sha256(assisted_candidate),
+                                        attempts=attempts,
+                                    ),
+                                )
+                    except GlobalProviderError:
+                        raise
+                    except (ContentPolicyError, ReviewerResponseError, ProviderError) as exc:
+                        assisted_record.error_type = _error_name(exc)
+
+                cleanup_record = AttemptRecord(
+                    number=len(attempts) + 1,
+                    strategy="source_preserving_cleanup",
+                    effective_dpi=round(source_page_dpi, 2),
+                )
+                attempts.append(cleanup_record)
+                accepted, discrepancies = _verification_accepts(
+                    client,
+                    source,
+                    candidate,
+                    tolerated_categories=source_tolerated_categories,
+                    confirm_rejections=True,
+                )
+                evidence_regions = [
+                    _source_region(item)
+                    for item in discrepancies
+                    if item.category in _SOURCE_EVIDENCE_RECOVERY_CATEGORIES
+                ]
+                if not accepted and evidence_regions:
+                    evidence_recreation = restore_source_evidence_regions(
+                        source,
+                        recreation,
+                        evidence_regions,
+                    )
+                    evidence_candidate = finalize_candidate(evidence_recreation)
+                    evidence_deterministic = validate_candidate(
+                        source,
+                        evidence_candidate,
+                        min_effective_dpi=settings.min_effective_dpi,
+                        effective_dpi=source_page_dpi,
+                    )
+                    cleanup_record.local_issues = evidence_deterministic.issues
+                    if evidence_deterministic.accepted:
+                        accepted, discrepancies = _verification_accepts(
+                            client,
+                            source,
+                            evidence_candidate,
+                            tolerated_categories=source_tolerated_categories,
+                            confirm_rejections=True,
+                        )
+                        if accepted:
+                            recreation = evidence_recreation
+                            candidate = evidence_candidate
+                cleanup_record.verification_categories = list(
+                    dict.fromkeys(item.category for item in discrepancies)
+                )
+                cleanup_record.accepted = accepted
+                if accepted:
+                    return PageOutcome(
+                        output_image=recreation,
+                        record=PageRecord(
+                            page=page_number,
+                            status="source_preserving_clean",
+                            source_render_sha256=source_hash,
+                            final_render_sha256=pixel_sha256(candidate),
+                            attempts=attempts,
+                        ),
+                    )
+            else:
+                cleanup_record = AttemptRecord(
+                    number=len(attempts) + 1,
+                    strategy="source_preserving_cleanup",
+                    effective_dpi=round(source_page_dpi, 2),
+                    local_issues=deterministic.issues,
+                )
+                attempts.append(cleanup_record)
+        except ContentPolicyError as exc:
+            if cleanup_record is None:
+                cleanup_record = AttemptRecord(
+                    number=len(attempts) + 1,
+                    strategy="source_preserving_cleanup",
+                    effective_dpi=round(source_page_dpi, 2),
+                )
+                attempts.append(cleanup_record)
+            cleanup_record.error_type = _error_name(exc)
+            fallback_reason = "content_policy"
+        except CostLimitReached as exc:
+            if cleanup_record is None:
+                cleanup_record = AttemptRecord(
+                    number=len(attempts) + 1,
+                    strategy="source_preserving_cleanup",
+                    effective_dpi=round(source_page_dpi, 2),
+                )
+                attempts.append(cleanup_record)
+            cleanup_record.error_type = _error_name(exc)
+            fallback_reason = "cost_limit"
+            cost_stopped = True
+        except GlobalProviderError:
+            raise
+        except (ReviewerResponseError, ProviderError) as exc:
+            if cleanup_record is None:
+                cleanup_record = AttemptRecord(
+                    number=len(attempts) + 1,
+                    strategy="source_preserving_cleanup",
+                    effective_dpi=round(source_page_dpi, 2),
+                )
+                attempts.append(cleanup_record)
+            cleanup_record.error_type = _error_name(exc)
+            fallback_reason = "provider_or_review_error"
     return PageOutcome(
         output_image=source,
         record=PageRecord(
@@ -313,7 +569,7 @@ def _core_manifest(report: DocumentReport) -> dict[str, object]:
 
 def _base_report(paths: OutputPaths, settings: Settings) -> DocumentReport:
     return DocumentReport(
-        schema_version=4,
+        schema_version=6,
         run_id=uuid4().hex,
         source=str(paths.source),
         output=str(paths.output),
