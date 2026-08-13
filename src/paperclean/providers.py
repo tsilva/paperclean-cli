@@ -7,7 +7,7 @@ from typing import Protocol, Self
 
 from PIL import Image
 
-from paperclean.models import ReviewVerdict
+from paperclean.models import PageGeometry, ReviewVerdict
 from paperclean.preflight import CostProjection
 
 
@@ -38,6 +38,8 @@ class ModelClient(Protocol):
     ) -> CostProjection: ...
 
     def generate(self, source: Image.Image, prompt: str, *, max_edge: int) -> Image.Image: ...
+
+    def locate_page(self, source: Image.Image) -> PageGeometry | None: ...
 
     def review(
         self,

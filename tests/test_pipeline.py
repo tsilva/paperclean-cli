@@ -4,17 +4,19 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 
 from paperclean.config import Settings
 from paperclean.discovery import output_paths
 from paperclean.errors import ProviderError, ReviewerResponseError
-from paperclean.models import Discrepancy, ReviewVerdict
+from paperclean.models import Discrepancy, PageGeometry, ReviewVerdict
 from paperclean.openrouter import CostTracker
 from paperclean.pipeline import GENERATION_PROMPT, clean_image, report_has_fallback, report_summary
 from paperclean.prompting import PUNCH_HOLE_REPAIR_PROMPT
 from paperclean.provenance import extract_png
+from paperclean.restoration import PagePlane
 from paperclean.validation import DeterministicResult
 
 
@@ -27,6 +29,9 @@ class FakeClient:
     def generate(self, source: Image.Image, _prompt: str, *, max_edge: int) -> Image.Image:
         assert max_edge > 0
         return source.copy()
+
+    def locate_page(self, _source: Image.Image) -> PageGeometry | None:
+        return None
 
     def review(
         self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
@@ -93,6 +98,456 @@ def test_clean_image_accepts_only_after_five_model_verifications(
     }
 
 
+def test_photographed_page_is_rectified_then_model_recreated_and_verified(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "photo.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.detect_page_plane",
+        lambda _source: PagePlane(
+            corners=np.asarray(((0, 0), (299, 0), (299, 399), (0, 399)), dtype=np.float32),
+            area_fraction=0.8,
+            confidence=0.95,
+        ),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class PhotoClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generate_calls = 0
+            self.locate_calls = 0
+
+        def locate_page(self, _source: Image.Image) -> PageGeometry | None:
+            self.locate_calls += 1
+            return PageGeometry(
+                corners=((0.0, 0.0), (0.997, 0.0), (0.997, 0.997), (0.0, 0.997)),
+                content_corners=((0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95)),
+                occlusions=(),
+                confidence=0.95,
+            )
+
+        def generate(self, source: Image.Image, _prompt: str, *, max_edge: int) -> Image.Image:
+            self.generate_calls += 1
+            assert max_edge > 0
+            return source.copy()
+
+    client = PhotoClient()
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="fake", max_attempts=1),
+        client,  # type: ignore[arg-type]
+        force=False,
+    )
+
+    page = report.pages[0]
+    assert page.status == "model_assisted_clean"
+    assert client.locate_calls == 1
+    assert client.generate_calls == 1
+    assert client.review_calls == 5
+    assert page.attempts[0].generated_width == 300
+    assert page.attempts[0].generated_height == 400
+
+
+def test_photographed_page_semantic_review_arbitrates_fold_foreground_loss(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "photo.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.detect_page_plane",
+        lambda _source: PagePlane(
+            corners=np.asarray(((0, 0), (299, 0), (299, 399), (0, 399)), dtype=np.float32),
+            area_fraction=0.8,
+            confidence=0.95,
+        ),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(False, ["large_foreground_loss"]),
+    )
+
+    class FoldedPhotoClient(FakeClient):
+        def locate_page(self, _source: Image.Image) -> PageGeometry | None:
+            return PageGeometry(
+                corners=((0.0, 0.0), (0.997, 0.0), (0.997, 0.997), (0.0, 0.997)),
+                content_corners=((0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95)),
+                occlusions=(),
+                confidence=0.95,
+            )
+
+    client = FoldedPhotoClient()
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="fake", max_attempts=1),
+        client,  # type: ignore[arg-type]
+        force=False,
+    )
+
+    assert report.pages[0].status == "model_assisted_clean"
+    assert client.review_calls == 5
+    assert report.pages[0].attempts[0].local_issues == ["large_foreground_loss"]
+
+
+@pytest.mark.parametrize(
+    "issue",
+    [
+        "page_registration_failed",
+        "candidate_canvas_mismatch",
+        "large_candidate_only_foreground",
+        "generated_resolution_below_minimum",
+    ],
+)
+def test_photographed_page_keeps_non_fold_local_failures_as_hard_blocks(
+    tmp_path: Path, monkeypatch, issue: str
+) -> None:
+    source = tmp_path / "photo.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.detect_page_plane",
+        lambda _source: PagePlane(
+            corners=np.asarray(((0, 0), (299, 0), (299, 399), (0, 399)), dtype=np.float32),
+            area_fraction=0.8,
+            confidence=0.95,
+        ),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(False, [issue]),
+    )
+
+    class InvalidPhotoClient(FakeClient):
+        def locate_page(self, _source: Image.Image) -> PageGeometry | None:
+            return PageGeometry(
+                corners=((0.0, 0.0), (0.997, 0.0), (0.997, 0.997), (0.0, 0.997)),
+                content_corners=((0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95)),
+                occlusions=(),
+                confidence=0.95,
+            )
+
+    client = InvalidPhotoClient()
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="fake", max_attempts=1),
+        client,  # type: ignore[arg-type]
+        force=False,
+    )
+
+    assert report.pages[0].status == "original_fallback"
+    assert client.review_calls == 0
+
+
+def test_photographed_page_restores_changed_authored_region_before_retrying_generation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "photo.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.detect_page_plane",
+        lambda _source: PagePlane(
+            corners=np.asarray(((0, 0), (299, 0), (299, 399), (0, 399)), dtype=np.float32),
+            area_fraction=0.8,
+            confidence=0.95,
+        ),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    restored_regions: list[list[tuple[float, float, float, float]]] = []
+
+    def restore(_source, candidate, regions, **_kwargs):
+        restored_regions.append(list(regions))
+        return candidate
+
+    monkeypatch.setattr("paperclean.pipeline.replace_with_source_evidence_regions", restore)
+
+    class ChangedStampClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generate_calls = 0
+
+        def locate_page(self, _source: Image.Image) -> PageGeometry | None:
+            return PageGeometry(
+                corners=((0.0, 0.0), (0.997, 0.0), (0.997, 0.997), (0.0, 0.997)),
+                content_corners=((0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95)),
+                occlusions=(),
+                confidence=0.95,
+            )
+
+        def generate(self, source: Image.Image, _prompt: str, *, max_edge: int) -> Image.Image:
+            self.generate_calls += 1
+            return source.copy()
+
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                return ReviewVerdict(
+                    content_match=False,
+                    scanner_quality=True,
+                    discrepancies=[
+                        Discrepancy("changed_stamp", "high", (0.55, 0.70, 0.80, 0.90))
+                    ],
+                )
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = ChangedStampClient()
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="fake", max_attempts=2),
+        client,  # type: ignore[arg-type]
+        force=False,
+    )
+
+    assert report.pages[0].status == "model_assisted_clean"
+    assert client.generate_calls == 1
+    assert client.review_calls == 11
+    assert restored_regions == [[(0.55, 0.70, 0.80, 0.90)]]
+
+
+def test_photographed_page_iteratively_restores_newly_exposed_source_regions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "photo.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.detect_page_plane",
+        lambda _source: PagePlane(
+            corners=np.asarray(((0, 0), (299, 0), (299, 399), (0, 399)), dtype=np.float32),
+            area_fraction=0.8,
+            confidence=0.95,
+        ),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    restored_regions: list[list[tuple[float, float, float, float]]] = []
+
+    def restore(_source, candidate, regions, **_kwargs):
+        restored_regions.append(list(regions))
+        return candidate
+
+    monkeypatch.setattr("paperclean.pipeline.replace_with_source_evidence_regions", restore)
+
+    class IterativeClient(FakeClient):
+        def locate_page(self, _source: Image.Image) -> PageGeometry | None:
+            return PageGeometry(
+                corners=((0.0, 0.0), (0.997, 0.0), (0.997, 0.997), (0.0, 0.997)),
+                content_corners=((0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95)),
+                occlusions=(),
+                confidence=0.95,
+            )
+
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 2:
+                discrepancy = Discrepancy("missing_text", "high", (0.1, 0.1, 0.3, 0.2))
+                return ReviewVerdict(False, True, [discrepancy])
+            if self.review_calls <= 4:
+                discrepancy = Discrepancy("changed_stamp", "high", (0.6, 0.7, 0.8, 0.85))
+                return ReviewVerdict(False, True, [discrepancy])
+            return ReviewVerdict(True, True)
+
+    client = IterativeClient()
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="fake", max_attempts=1),
+        client,  # type: ignore[arg-type]
+        force=False,
+    )
+
+    assert report.pages[0].status == "model_assisted_clean"
+    assert restored_regions == [
+        [(0.1, 0.1, 0.3, 0.2), pytest.approx((0.33, 0.385, 0.44, 0.4675))]
+    ]
+
+
+def test_photographed_page_repairs_localized_quality_region_after_content_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "photo.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.detect_page_plane",
+        lambda _source: PagePlane(
+            corners=np.asarray(((0, 0), (299, 0), (299, 399), (0, 399)), dtype=np.float32),
+            area_fraction=0.8,
+            confidence=0.95,
+        ),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    repairs: list[tuple[float, float, float, float]] = []
+
+    def repair(_source, candidate, region, **_kwargs):
+        repairs.append(region)
+        return candidate
+
+    monkeypatch.setattr("paperclean.pipeline.repair_region", repair)
+
+    class QualityRepairClient(FakeClient):
+        def locate_page(self, _source: Image.Image) -> PageGeometry | None:
+            return PageGeometry(
+                corners=((0.0, 0.0), (0.997, 0.0), (0.997, 0.997), (0.0, 0.997)),
+                content_corners=((0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95)),
+                occlusions=(),
+                confidence=0.95,
+            )
+
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 3:
+                discrepancy = Discrepancy("scanner_quality", "high", (0.2, 0.2, 0.4, 0.35))
+                return ReviewVerdict(True, False, [discrepancy])
+            return ReviewVerdict(True, True)
+
+    client = QualityRepairClient()
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="fake", max_attempts=1),
+        client,  # type: ignore[arg-type]
+        force=False,
+    )
+
+    assert report.pages[0].status == "model_assisted_clean"
+    assert len(repairs) == 1
+    assert repairs[0] == pytest.approx((0.15, 0.125, 0.45, 0.425))
+
+
+def test_photographed_page_uses_verified_source_preserving_rectification_when_generation_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "photo.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.detect_page_plane",
+        lambda _source: PagePlane(
+            corners=np.asarray(((0, 0), (299, 0), (299, 399), (0, 399)), dtype=np.float32),
+            area_fraction=0.8,
+            confidence=0.95,
+        ),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+
+    class SourceFallbackClient(FakeClient):
+        def locate_page(self, _source: Image.Image) -> PageGeometry | None:
+            return PageGeometry(
+                corners=((0.0, 0.0), (0.997, 0.0), (0.997, 0.997), (0.0, 0.997)),
+                content_corners=((0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95)),
+                occlusions=(),
+                confidence=0.95,
+            )
+
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 50:
+                return ReviewVerdict(
+                    content_match=False,
+                    scanner_quality=True,
+                    discrepancies=[Discrepancy("invented_text", "high", (0.2, 0.2, 0.8, 0.8))],
+                )
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = SourceFallbackClient()
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="fake", max_attempts=1),
+        client,  # type: ignore[arg-type]
+        force=False,
+    )
+
+    page = report.pages[0]
+    assert page.status == "source_preserving_clean"
+    assert [attempt.strategy for attempt in page.attempts] == [
+        "model_assisted_source_cleanup",
+        "source_preserving_cleanup",
+    ]
+    assert page.attempts[-1].accepted is True
+
+
+def test_photographed_source_fallback_repairs_localized_quality_region(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "photo.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.detect_page_plane",
+        lambda _source: PagePlane(
+            corners=np.asarray(((0, 0), (299, 0), (299, 399), (0, 399)), dtype=np.float32),
+            area_fraction=0.8,
+            confidence=0.95,
+        ),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    repairs: list[tuple[float, float, float, float]] = []
+
+    def repair(_source, candidate, region, **_kwargs):
+        repairs.append(region)
+        return candidate
+
+    monkeypatch.setattr("paperclean.pipeline.repair_region", repair)
+
+    class QualityFallbackClient(FakeClient):
+        def locate_page(self, _source: Image.Image) -> PageGeometry | None:
+            return PageGeometry(
+                corners=((0.0, 0.0), (0.997, 0.0), (0.997, 0.997), (0.0, 0.997)),
+                content_corners=((0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95)),
+                occlusions=(),
+                confidence=0.95,
+            )
+
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            if self.review_calls <= 50:
+                return ReviewVerdict(
+                    False,
+                    True,
+                    [Discrepancy("invented_text", "high", (0.2, 0.2, 0.8, 0.8))],
+                )
+            if self.review_calls <= 53:
+                return ReviewVerdict(
+                    True,
+                    False,
+                    [Discrepancy("scanner_quality", "high", (0.2, 0.2, 0.4, 0.35))],
+                )
+            return ReviewVerdict(True, True)
+
+    client = QualityFallbackClient()
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="fake", max_attempts=1),
+        client,  # type: ignore[arg-type]
+        force=False,
+    )
+
+    assert report.pages[0].status == "source_preserving_clean"
+    assert len(repairs) == 1
+    assert repairs[0] == pytest.approx((0.15, 0.125, 0.45, 0.425))
+
+
 def test_clean_image_records_agentbridge_subscription_provenance(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -121,6 +576,48 @@ def test_clean_image_records_agentbridge_subscription_provenance(
     assert sidecar["backend"] == "agentbridge"
     assert sidecar["billing_mode"] == "codex_subscription"
     assert sidecar["cost_usd"] is None
+
+
+def test_agentbridge_ordinary_scan_verifies_source_cleanup_before_generation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.authored_punch_hole_regions",
+        lambda _source: [],
+    )
+
+    class SourceFirstClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generate_calls = 0
+
+        def generate(
+            self, source: Image.Image, _prompt: str, *, max_edge: int
+        ) -> Image.Image:
+            self.generate_calls += 1
+            return source.copy()
+
+    client = SourceFirstClient()
+    settings = Settings(
+        api_key="",
+        backend="agentbridge",
+        base_url="http://127.0.0.1:8082/api/v1",
+        image_model="codex/gpt-5.6-sol",
+        review_model="codex/gpt-5.6-sol",
+    )
+
+    report = clean_image(output_paths(source), settings, client, force=False)  # type: ignore[arg-type]
+
+    assert report.pages[0].status == "source_preserving_clean"
+    assert report.pages[0].attempts[0].strategy == "source_preserving_cleanup"
+    assert client.generate_calls == 0
+    assert client.review_calls == 5
 
 
 def test_low_resolution_generation_is_upscaled_to_source_resolution_output(

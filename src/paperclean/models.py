@@ -61,6 +61,26 @@ class ReviewVerdict:
         return self.content_match and self.scanner_quality and not self.discrepancies
 
 
+@dataclass(frozen=True, slots=True)
+class PageGeometry:
+    corners: tuple[
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+    ]
+    content_corners: tuple[
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+    ]
+    occlusions: tuple[tuple[tuple[float, float], ...], ...]
+    confidence: float
+    page_polygon: tuple[tuple[float, float], ...] = ()
+    edge_content: tuple[tuple[tuple[float, float], ...], ...] = ()
+
+
 @dataclass(slots=True)
 class AttemptRecord:
     number: int

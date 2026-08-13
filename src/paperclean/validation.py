@@ -66,6 +66,14 @@ def _foreground_issues(
         dtype=np.float64,
     )
     pixel_matrix = to_pixels @ candidate_to_source @ np.linalg.inv(to_pixels)
+    candidate_plane = cv2.warpPerspective(
+        np.full_like(cand, 255, dtype=np.uint8),
+        pixel_matrix,
+        (src.shape[1], src.shape[0]),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
     cand = cv2.warpPerspective(
         cand,
         pixel_matrix,
@@ -81,6 +89,7 @@ def _foreground_issues(
         size = (max(1, round(width * scale)), max(1, round(height * scale)))
         src = cv2.resize(src, size, interpolation=cv2.INTER_AREA)
         cand = cv2.resize(cand, size, interpolation=cv2.INTER_AREA)
+        candidate_plane = cv2.resize(candidate_plane, size, interpolation=cv2.INTER_NEAREST)
     src_ink = cv2.adaptiveThreshold(
         src, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 15
     )
@@ -90,7 +99,12 @@ def _foreground_issues(
     kernel = np.ones((3, 3), np.uint8)
     src_ink = cv2.morphologyEx(src_ink, cv2.MORPH_OPEN, kernel)
     cand_ink = cv2.morphologyEx(cand_ink, cv2.MORPH_OPEN, kernel)
-    content_roi = _paper_roi(src)
+    # The registration homography maps the candidate page plane back into the
+    # photographed source. Restrict comparison to that polygon so fingers, desks,
+    # pavement, and other camera surroundings are not mistaken for missing document
+    # content. The independently detected paper ROI remains a conservative
+    # intersection when its boundary is reliable.
+    content_roi = cv2.bitwise_and(_paper_roi(src), candidate_plane)
     src_ink = cv2.bitwise_and(src_ink, content_roi)
     cand_ink = cv2.bitwise_and(cand_ink, content_roi)
     source_pixels = int(np.count_nonzero(src_ink))

@@ -5,7 +5,12 @@ import struct
 
 from PIL import Image
 
-from paperclean.imaging import finish_pristine_recreation, normalize_generated, review_views
+from paperclean.imaging import (
+    finish_pristine_recreation,
+    normalize_generated,
+    review_views,
+    source_dpi,
+)
 from paperclean.provenance import (
     embed_jpeg,
     embed_png,
@@ -76,3 +81,10 @@ def test_pristine_recreation_whitens_paper_and_retains_foreground() -> None:
     assert candidate.size == source.size
     assert candidate.getpixel((10, 10)) == (255, 255, 255)
     assert max(candidate.getpixel((60, 71))) < 80
+
+
+def test_camera_display_dpi_is_not_treated_as_document_resolution() -> None:
+    image = Image.new("RGB", (3072, 4080), "white")
+    image.info["dpi"] = (72.0, 72.0)
+
+    assert source_dpi(image) == 300

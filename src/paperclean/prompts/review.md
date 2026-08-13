@@ -4,6 +4,14 @@ note, signature, logo, stamp, table, diagram, redaction, and spatial relationshi
 identical after compensating for one global page rectification, while the candidate
 looks like a pristine freshly printed page.
 
+When `{view_name}` is a numbered region, both images are the exact same intentional
+crop from a larger page and its boundaries are artificial verification-tile edges.
+Compare only the evidence visible inside the two supplied tiles. Never report
+cropped_content, missing_text, or scanner_quality merely because content continues
+beyond a numbered region boundary or the tile does not show a complete physical page.
+Content touching an artificial tile edge is valid when the same visible fragments
+appear in both images.
+
 The candidate must remove non-content defects: punched holes, torn or dark edges, dirt,
 dust, stains, discoloration, folds, shadows, glare, blur, skew, rotation, and perspective
 distortion. Global de-skewing, perspective correction, scale-to-page, and clean margin

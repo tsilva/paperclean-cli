@@ -161,9 +161,16 @@ def pixel_sha256(image: Image.Image) -> str:
 
 
 def source_dpi(image: Image.Image, *, default: float = 300.0) -> float:
+    """Return a trustworthy document DPI, ignoring screen/camera metadata defaults.
+
+    Phone cameras and exported raster images commonly advertise 72 or 96 DPI even
+    when they contain several thousand pixels per page. Those values describe a
+    display convention, not the document's available resolution, and previously
+    caused high-resolution photographs to fail the local quality gate.
+    """
     raw = image.info.get("dpi")
     if isinstance(raw, tuple) and raw:
         value = float(raw[0])
-        if math.isfinite(value) and 36 <= value <= 2400:
+        if math.isfinite(value) and 150 <= value <= 2400:
             return value
     return default

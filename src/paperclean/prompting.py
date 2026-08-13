@@ -18,6 +18,8 @@ def load_prompt(name: str) -> str:
 
 
 GENERATION_PROMPT = load_prompt("generation.md")
+PHOTO_RECTIFICATION_PROMPT = load_prompt("photo-rectification.md")
+PAGE_LOCATION_PROMPT = load_prompt("page-location.md")
 REGIONAL_REPAIR_PROMPT = load_prompt("regional-repair.md")
 PUNCH_HOLE_REPAIR_PROMPT = load_prompt("punch-hole-repair.md")
 REVIEW_SYSTEM_PROMPT = load_prompt("review-system.md")

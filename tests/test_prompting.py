@@ -5,6 +5,8 @@ import pytest
 from paperclean.prompting import (
     FEEDBACK_TEMPLATE,
     GENERATION_PROMPT,
+    PAGE_LOCATION_PROMPT,
+    PHOTO_RECTIFICATION_PROMPT,
     PUNCH_HOLE_REPAIR_PROMPT,
     REGIONAL_REPAIR_PROMPT,
     REVIEW_PROMPT,
@@ -15,6 +17,8 @@ from paperclean.prompting import (
 
 def test_all_primary_prompts_load_from_packaged_markdown() -> None:
     assert load_prompt("generation.md") == GENERATION_PROMPT
+    assert load_prompt("page-location.md") == PAGE_LOCATION_PROMPT
+    assert load_prompt("photo-rectification.md") == PHOTO_RECTIFICATION_PROMPT
     assert load_prompt("punch-hole-repair.md") == PUNCH_HOLE_REPAIR_PROMPT
     assert load_prompt("regional-repair.md") == REGIONAL_REPAIR_PROMPT
     assert load_prompt("review.md") == REVIEW_PROMPT
@@ -26,6 +30,12 @@ def test_review_prompt_requires_unambiguous_punch_hole_reconstruction() -> None:
     assert "punch hole overlaps authored ink" in REVIEW_PROMPT
     assert "merely plausible completion is not enough" in REVIEW_PROMPT
     assert "preserves the uncertain source evidence" in REVIEW_PROMPT
+
+
+def test_review_prompt_explains_artificial_regional_crop_boundaries() -> None:
+    assert "exact same intentional" in REVIEW_PROMPT and "crop from a larger page" in REVIEW_PROMPT
+    assert "artificial verification-tile edges" in REVIEW_PROMPT
+    assert "Never report" in REVIEW_PROMPT and "cropped_content" in REVIEW_PROMPT
 
 
 @pytest.mark.parametrize(

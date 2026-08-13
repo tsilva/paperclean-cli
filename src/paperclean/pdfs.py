@@ -19,6 +19,22 @@ from paperclean.errors import InputError, UnsafePdfError
 from paperclean.provenance import canonical_json
 
 MAX_RENDER_EDGE = 6000
+_EMPTY_PDF_PASSWORD = ""
+
+
+def _open_pdf(path: Path) -> Pdf:
+    """Open plain PDFs and owner-restricted PDFs with an empty user password.
+
+    Many scanners add owner permissions while leaving the user password empty.  Such
+    files open normally in readers and require no credential.  Supplying the explicit
+    empty password lets pikepdf decrypt them for the same raster/sanitization path;
+    genuinely password-protected documents still raise PasswordError.
+    """
+    return Pdf.open(
+        path,
+        password=_EMPTY_PDF_PASSWORD,
+        inherit_page_attributes=False,
+    )
 
 
 @dataclass(slots=True)
@@ -101,14 +117,12 @@ def _user_unit(page: pikepdf.Page) -> float:
 
 def inspect_pdf(path: Path) -> PdfInspection:
     try:
-        pdf = Pdf.open(path, inherit_page_attributes=False)
+        pdf = _open_pdf(path)
     except pikepdf.PasswordError as exc:
         raise UnsafePdfError("encrypted PDFs are not supported") from exc
     except pikepdf.PdfError as exc:
         raise InputError(f"cannot open PDF: {path}") from exc
     with pdf:
-        if pdf.is_encrypted:
-            raise UnsafePdfError("encrypted PDFs are not supported")
         if not pdf.pages:
             raise InputError("PDF has no pages")
         removed: set[str] = set()
@@ -188,9 +202,9 @@ def _text_signature(page: pdfium.PdfPage) -> str:
 def render_pages(path: Path, *, dpi: int) -> list[RenderedPage]:
     inspection = inspect_pdf(path)
     del inspection
-    with Pdf.open(path, inherit_page_attributes=False) as structure:
+    with _open_pdf(path) as structure:
         geometries = [(_box(page), _rotation(page), _user_unit(page)) for page in structure.pages]
-    document = pdfium.PdfDocument(path)
+    document = pdfium.PdfDocument(path, password=_EMPTY_PDF_PASSWORD)
     try:
         document.init_forms()
         rendered: list[RenderedPage] = []
@@ -309,7 +323,7 @@ def build_pdf(
     run_id: str | None = None,
 ) -> None:
     try:
-        pdf = Pdf.open(source, inherit_page_attributes=False)
+        pdf = _open_pdf(source)
     except pikepdf.PdfError as exc:
         raise InputError(f"cannot reopen PDF: {source}") from exc
     with pdf:
@@ -339,9 +353,34 @@ def render_overlay_preview(
     *,
     dpi: int,
 ) -> Image.Image:
-    """Render a scratch copy so review sees the actual PDF composition path."""
-    originals = render_pages(source, dpi=dpi)
-    images = [page.image for page in originals]
-    images[page_index] = candidate
-    build_pdf(source, destination, images)
-    return render_pages(destination, dpi=dpi)[page_index].image
+    """Render one scratch page through the exact PDF overlay composition path.
+
+    Verification only needs the selected page.  Copying and rasterizing the whole
+    source document for every candidate makes preview work quadratic in page count
+    and can consume gigabytes for image-heavy PDFs.
+    """
+    try:
+        with _open_pdf(source) as original:
+            if not 0 <= page_index < len(original.pages):
+                raise IndexError("PDF preview page index is out of range")
+            preview = Pdf.new()
+            try:
+                preview.pages.append(original.pages[page_index])
+                _overlay_page(preview.pages[0], candidate)
+                _sanitize_pdf(preview)
+                preview.save(
+                    destination,
+                    compress_streams=True,
+                    object_stream_mode=pikepdf.ObjectStreamMode.generate,
+                    linearize=False,
+                )
+            finally:
+                preview.close()
+    except pikepdf.PasswordError as exc:
+        raise UnsafePdfError("encrypted PDFs are not supported") from exc
+    except pikepdf.PdfError as exc:
+        raise InputError(f"cannot build PDF preview: {source}") from exc
+    rendered = render_pages(destination, dpi=dpi)
+    if len(rendered) != 1:
+        raise ValueError("PDF preview must contain exactly one page")
+    return rendered[0].image

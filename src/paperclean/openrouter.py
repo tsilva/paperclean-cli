@@ -26,7 +26,7 @@ from paperclean.errors import (
     ReviewerResponseError,
 )
 from paperclean.imaging import data_url, decode_bytes, decode_data_url
-from paperclean.models import Discrepancy, ReviewVerdict, UsageRecord
+from paperclean.models import Discrepancy, PageGeometry, ReviewVerdict, UsageRecord
 from paperclean.preflight import (
     REVIEW_MAX_COMPLETION_TOKENS,
     CostProjection,
@@ -34,7 +34,7 @@ from paperclean.preflight import (
     build_cost_projection,
     parse_unit_prices,
 )
-from paperclean.prompting import REVIEW_PROMPT, REVIEW_SYSTEM_PROMPT
+from paperclean.prompting import PAGE_LOCATION_PROMPT, REVIEW_PROMPT, REVIEW_SYSTEM_PROMPT
 
 ALLOWED_CATEGORIES = (
     "changed_text",
@@ -97,6 +97,91 @@ REVIEW_SCHEMA: dict[str, Any] = {
                             "minItems": 4,
                             "maxItems": 4,
                         },
+                    },
+                },
+            },
+        },
+    },
+}
+
+PAGE_LOCATION_SCHEMA: dict[str, Any] = {
+    "name": "paperclean_page_geometry",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "found",
+            "confidence",
+            "corners",
+            "page_polygon",
+            "content_corners",
+            "edge_content",
+            "occlusions",
+        ],
+        "properties": {
+            "found": {"type": "boolean"},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "corners": {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 4,
+                "items": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+            },
+            "page_polygon": {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 40,
+                "items": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+            },
+            "content_corners": {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 4,
+                "items": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+            },
+            "edge_content": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {
+                    "type": "array",
+                    "minItems": 4,
+                    "maxItems": 20,
+                    "items": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": {"type": "number", "minimum": 0, "maximum": 1},
+                    },
+                },
+            },
+            "occlusions": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 20,
+                    "items": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": {"type": "number", "minimum": 0, "maximum": 1},
                     },
                 },
             },
@@ -540,6 +625,103 @@ class OpenRouterClient:
             raise
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ReviewerResponseError("the reviewer returned invalid structured output") from exc
+
+    def locate_page(self, source: Image.Image) -> PageGeometry | None:
+        endpoint = self._required_endpoint(self.review_endpoint, "preflight review endpoint")
+        body: dict[str, Any] = {
+            "model": endpoint.model,
+            "messages": [
+                {"role": "system", "content": "Analyze document geometry conservatively."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": PAGE_LOCATION_PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url(source, max_edge=2048)},
+                        },
+                    ],
+                },
+            ],
+            "response_format": {"type": "json_schema", "json_schema": PAGE_LOCATION_SCHEMA},
+            "provider": {"only": [endpoint.provider_slug], "require_parameters": True},
+        }
+        if "reasoning_effort" in endpoint.supported_parameters:
+            body["reasoning_effort"] = "medium"
+        body[
+            "max_completion_tokens"
+            if "max_completion_tokens" in endpoint.supported_parameters
+            else "max_tokens"
+        ] = 1024
+        response = self._request("POST", "/chat/completions", json_body=body, paid=True)
+        self.costs.record(
+            response.get("usage") if isinstance(response.get("usage"), dict) else None
+        )
+        try:
+            message = response["choices"][0]["message"]
+            content = message["content"]
+            value = json.loads(content) if isinstance(content, str) else content
+            if not isinstance(value, dict) or value.get("found") is not True:
+                return None
+            confidence = float(value["confidence"])
+            rows = value["corners"]
+            page_polygon_rows = value["page_polygon"]
+            content_rows = value["content_corners"]
+            edge_content_rows = value["edge_content"]
+            occlusion_rows = value["occlusions"]
+            if (
+                not isinstance(rows, list)
+                or len(rows) != 4
+                or not isinstance(page_polygon_rows, list)
+                or not 4 <= len(page_polygon_rows) <= 40
+                or not isinstance(content_rows, list)
+                or len(content_rows) != 4
+                or not isinstance(edge_content_rows, list)
+                or not isinstance(occlusion_rows, list)
+            ):
+                raise ValueError("invalid corner count")
+            corner_type = tuple[
+                tuple[float, float],
+                tuple[float, float],
+                tuple[float, float],
+                tuple[float, float],
+            ]
+            corners = cast(corner_type, tuple((float(row[0]), float(row[1])) for row in rows))
+            page_polygon = tuple((float(row[0]), float(row[1])) for row in page_polygon_rows)
+            content_corners = cast(
+                corner_type,
+                tuple((float(row[0]), float(row[1])) for row in content_rows),
+            )
+            edge_content = tuple(
+                tuple((float(point[0]), float(point[1])) for point in polygon)
+                for polygon in edge_content_rows
+            )
+            occlusions = tuple(
+                tuple((float(point[0]), float(point[1])) for point in polygon)
+                for polygon in occlusion_rows
+            )
+            if any(
+                not 0 <= coordinate <= 1
+                for point in (
+                    *corners,
+                    *page_polygon,
+                    *content_corners,
+                    *(point for polygon in edge_content for point in polygon),
+                    *(point for polygon in occlusions for point in polygon),
+                )
+                for coordinate in point
+            ):
+                raise ValueError("corner out of bounds")
+            return PageGeometry(
+                corners=corners,
+                content_corners=content_corners,
+                occlusions=occlusions,
+                confidence=confidence,
+                page_polygon=page_polygon,
+                edge_content=edge_content,
+            )
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReviewerResponseError("the page locator returned invalid output") from exc
 
     @staticmethod
     def _required_endpoint(endpoint: Endpoint | None, message: str) -> Endpoint:

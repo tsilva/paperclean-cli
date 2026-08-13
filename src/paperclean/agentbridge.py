@@ -6,7 +6,7 @@ import base64
 import json
 import threading
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from PIL import Image
@@ -21,10 +21,10 @@ from paperclean.errors import (
     ReviewerResponseError,
 )
 from paperclean.imaging import data_url, decode_bytes
-from paperclean.models import ReviewVerdict, UsageRecord
-from paperclean.openrouter import REVIEW_SCHEMA, _parse_verdict
+from paperclean.models import PageGeometry, ReviewVerdict, UsageRecord
+from paperclean.openrouter import PAGE_LOCATION_SCHEMA, REVIEW_SCHEMA, _parse_verdict
 from paperclean.preflight import CostProjection, build_subscription_projection
-from paperclean.prompting import REVIEW_PROMPT, REVIEW_SYSTEM_PROMPT
+from paperclean.prompting import PAGE_LOCATION_PROMPT, REVIEW_PROMPT, REVIEW_SYSTEM_PROMPT
 
 MAX_IMAGE_RESPONSE_BYTES = 32 * 1024 * 1024
 
@@ -214,6 +214,106 @@ class AgentBridgeClient:
         except (InputError, ValueError) as exc:
             raise ProviderError("AgentBridge returned invalid image base64") from exc
 
+    def locate_page(self, source: Image.Image) -> PageGeometry | None:
+        response = self._request(
+            "POST",
+            "/chat/completions",
+            json_body={
+                "model": self.settings.review_model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Analyze document geometry conservatively.",
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": PAGE_LOCATION_PROMPT},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url(source, max_edge=2048)},
+                            },
+                        ],
+                    },
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": PAGE_LOCATION_SCHEMA,
+                },
+                "reasoning_effort": "medium",
+                "max_tokens": 1024,
+                "store": False,
+            },
+        )
+        usage_raw = response.get("usage")
+        self.costs.record(usage_raw if isinstance(usage_raw, dict) else None)
+        try:
+            content = response["choices"][0]["message"]["content"]
+            value = json.loads(content) if isinstance(content, str) else content
+            if not isinstance(value, dict) or value.get("found") is not True:
+                return None
+            confidence = float(value["confidence"])
+            rows = value["corners"]
+            page_polygon_rows = value["page_polygon"]
+            content_rows = value["content_corners"]
+            edge_content_rows = value["edge_content"]
+            occlusion_rows = value["occlusions"]
+            if (
+                not isinstance(rows, list)
+                or len(rows) != 4
+                or not isinstance(page_polygon_rows, list)
+                or not 4 <= len(page_polygon_rows) <= 40
+                or not isinstance(content_rows, list)
+                or len(content_rows) != 4
+                or not isinstance(edge_content_rows, list)
+                or not isinstance(occlusion_rows, list)
+            ):
+                raise ValueError("invalid corner count")
+            corner_type = tuple[
+                tuple[float, float],
+                tuple[float, float],
+                tuple[float, float],
+                tuple[float, float],
+            ]
+            corners = cast(corner_type, tuple((float(row[0]), float(row[1])) for row in rows))
+            page_polygon = tuple((float(row[0]), float(row[1])) for row in page_polygon_rows)
+            content_corners = cast(
+                corner_type,
+                tuple((float(row[0]), float(row[1])) for row in content_rows),
+            )
+            edge_content = tuple(
+                tuple((float(point[0]), float(point[1])) for point in polygon)
+                for polygon in edge_content_rows
+            )
+            occlusions = tuple(
+                tuple((float(point[0]), float(point[1])) for point in polygon)
+                for polygon in occlusion_rows
+            )
+            if any(
+                not 0 <= coordinate <= 1
+                for point in (
+                    *corners,
+                    *page_polygon,
+                    *content_corners,
+                    *(point for polygon in edge_content for point in polygon),
+                    *(point for polygon in occlusions for point in polygon),
+                )
+                for coordinate in point
+            ):
+                raise ValueError("corner out of bounds")
+            return PageGeometry(
+                corners=corners,
+                content_corners=content_corners,
+                occlusions=occlusions,
+                confidence=confidence,
+                page_polygon=page_polygon,
+                edge_content=edge_content,
+            )
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReviewerResponseError(
+                "AgentBridge returned invalid structured page geometry"
+            ) from exc
+
     def review(
         self, source: Image.Image, candidate: Image.Image, *, view_name: str
     ) -> ReviewVerdict:
@@ -246,7 +346,7 @@ class AgentBridgeClient:
                     },
                 ],
                 "response_format": {"type": "json_schema", "json_schema": REVIEW_SCHEMA},
-                "reasoning_effort": "high",
+                "reasoning_effort": "medium",
                 "max_tokens": 2048,
                 "store": False,
             },

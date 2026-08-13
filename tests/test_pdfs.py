@@ -8,7 +8,7 @@ from pikepdf.canvas import Canvas, Helvetica, Text
 from PIL import Image, ImageDraw
 
 from paperclean.errors import UnsafePdfError
-from paperclean.pdfs import build_pdf, inspect_pdf, render_pages
+from paperclean.pdfs import build_pdf, inspect_pdf, render_overlay_preview, render_pages
 from paperclean.provenance import manifest_wrapper
 
 
@@ -32,6 +32,36 @@ def _text_pdf(path: Path) -> None:
         pdf.save(path)
     finally:
         pdf.close()
+
+
+def _encrypt_pdf(path: Path, *, user_password: str) -> None:
+    with pikepdf.Pdf.open(path, allow_overwriting_input=True) as pdf:
+        pdf.save(
+            path,
+            encryption=pikepdf.Encryption(
+                owner="owner-secret",
+                user=user_password,
+                R=4,
+            ),
+        )
+
+
+def test_owner_restricted_pdf_with_empty_user_password_is_supported(tmp_path: Path) -> None:
+    source = tmp_path / "owner-restricted.pdf"
+    _blank_pdf(source)
+    _encrypt_pdf(source, user_password="")
+
+    assert inspect_pdf(source).page_count == 1
+    assert len(render_pages(source, dpi=72)) == 1
+
+
+def test_pdf_with_real_user_password_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "password-protected.pdf"
+    _blank_pdf(source)
+    _encrypt_pdf(source, user_password="required-secret")
+
+    with pytest.raises(UnsafePdfError, match="encrypted PDFs"):
+        inspect_pdf(source)
 
 
 def test_build_pdf_overlays_all_pages_and_embeds_manifest(tmp_path: Path) -> None:
@@ -87,6 +117,19 @@ def test_raster_overlay_preserves_searchable_text_layer(tmp_path: Path) -> None:
     build_pdf(source, output, [original.image])
     final = render_pages(output, dpi=150)[0]
     assert final.text_signature == original.text_signature
+
+
+def test_overlay_preview_contains_only_selected_page(tmp_path: Path) -> None:
+    source = tmp_path / "multi-page.pdf"
+    preview = tmp_path / "preview.pdf"
+    _blank_pdf(source, pages=5)
+    original = render_pages(source, dpi=72)[3]
+    candidate = Image.new("RGB", original.image.size, "red")
+
+    rendered = render_overlay_preview(source, 3, candidate, preview, dpi=72)
+
+    assert inspect_pdf(preview).page_count == 1
+    assert rendered.getpixel((rendered.width // 2, rendered.height // 2)) == (255, 0, 0)
 
 
 @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
