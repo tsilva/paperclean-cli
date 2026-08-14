@@ -113,7 +113,7 @@ def test_clean_image_accepts_only_after_five_model_verifications(
         force=False,
     )  # type: ignore[arg-type]
     assert report.pages[0].status == "model_generated_clean"
-    assert report.schema_version == 6
+    assert report.schema_version == 7
     assert report.backend == "openrouter"
     assert report.billing_mode == "openrouter_usd"
     assert report.verification_model == "openai/gpt-5.6-sol"
@@ -121,7 +121,7 @@ def test_clean_image_accepts_only_after_five_model_verifications(
     assert client.review_calls == 5
     embedded = extract_png(paths.output.read_bytes())
     assert embedded is not None
-    assert embedded["payload"]["schema_version"] == 6
+    assert embedded["payload"]["schema_version"] == 7
     assert embedded["payload"]["models"]["verification"] == "openai/gpt-5.6-sol"
     assert embedded["payload"]["verification"]["strategy"] == report.verification_strategy
     assert embedded["payload"]["pages"][0]["status"] == "model_generated_clean"
@@ -956,7 +956,7 @@ def test_confirmed_quality_only_rejection_fails_closed(tmp_path: Path, monkeypat
         force=False,
     )  # type: ignore[arg-type]
 
-    assert client.review_calls == 17
+    assert client.review_calls == 22
     assert report.pages[0].status == "original_fallback"
     assert report.pages[0].attempts[0].verification_categories == ["scanner_quality"]
     assert report.pages[0].attempts[1].strategy == "source_preserving_cleanup"
@@ -1224,7 +1224,7 @@ def test_authored_hole_regional_repair_retries_until_circle_is_removed(
     assert report.pages[0].status == "model_generated_clean"
 
 
-def test_authored_hole_repair_retries_when_text_is_still_missing(
+def test_authored_hole_repair_confirms_local_rejection_before_retrying(
     tmp_path: Path, monkeypatch
 ) -> None:
     source = tmp_path / "scan.png"
@@ -1276,7 +1276,7 @@ def test_authored_hole_repair_retries_when_text_is_still_missing(
         force=False,
     )  # type: ignore[arg-type]
 
-    assert repair_calls == 2
+    assert repair_calls == 1
     assert local_reviews == 2
     assert report.pages[0].status == "model_assisted_clean"
 
@@ -1515,10 +1515,15 @@ def test_source_cleanup_repairs_only_localized_quality_regions(tmp_path: Path, m
     )
     verification_results = iter(
         [
-            (False, [Discrepancy("scanner_quality", "low", (0.10, 0.0, 0.30, 0.02))]),
-            (False, [Discrepancy("scanner_quality", "low", (0.60, 0.95, 0.66, 0.98))]),
-            (False, [Discrepancy("scanner_quality", "low", (0.12, 0.02, 0.24, 0.04))]),
-            (False, [Discrepancy("scanner_quality", "low", (0.70, 0.92, 0.78, 0.95))]),
+            (
+                False,
+                [
+                    Discrepancy("scanner_quality", "low", (0.10, 0.0, 0.30, 0.02)),
+                    Discrepancy("scanner_quality", "low", (0.60, 0.95, 0.66, 0.98)),
+                    Discrepancy("scanner_quality", "low", (0.12, 0.02, 0.24, 0.04)),
+                    Discrepancy("scanner_quality", "low", (0.70, 0.92, 0.78, 0.95)),
+                ],
+            ),
             (True, []),
         ]
     )
@@ -1528,12 +1533,18 @@ def test_source_cleanup_repairs_only_localized_quality_regions(tmp_path: Path, m
         return next(verification_results)
 
     monkeypatch.setattr("paperclean.pipeline._verification_accepts", verify)
+    monkeypatch.setattr(
+        "paperclean.pipeline._incremental_content_accepts",
+        lambda *_args, **_kwargs: True,
+    )
     repair_regions: list[tuple[float, float, float, float]] = []
 
     def repair(repair_source, candidate, region, *_args, **_kwargs):
         assert repair_source is candidate
         repair_regions.append(region)
-        return candidate
+        changed = candidate.copy()
+        changed.putpixel((len(repair_regions), 0), (250, 250, 250))
+        return changed
 
     monkeypatch.setattr("paperclean.pipeline.repair_region", repair)
 
@@ -1574,16 +1585,17 @@ def test_source_cleanup_isolates_multiple_quality_repairs(tmp_path: Path, monkey
                     Discrepancy("scanner_quality", "medium", (0.01, 0.64, 0.99, 0.66)),
                 ],
             ),
-            (
-                False,
-                [Discrepancy("changed_text", "high", (0.05, 0.32, 0.20, 0.34))],
-            ),
             (True, []),
         ]
     )
     monkeypatch.setattr(
         "paperclean.pipeline._verification_accepts",
         lambda *_args, **_kwargs: next(verification_results),
+    )
+    content_results = iter([False, True])
+    monkeypatch.setattr(
+        "paperclean.pipeline._incremental_content_accepts",
+        lambda *_args, **_kwargs: next(content_results),
     )
     repair_regions: list[tuple[float, float, float, float]] = []
 
@@ -1933,9 +1945,9 @@ def test_source_cleanup_records_each_boolean_only_rejection(tmp_path: Path, monk
         force=False,
     )  # type: ignore[arg-type]
 
-    # Quality-only rejection now requires a two-of-three consensus before the
-    # subsequent content rejection and source-cleanup fallback are evaluated.
-    assert client.review_calls == 10
+    # The initial all-view localization records quality boxes without repeating
+    # consensus; only the final acceptance pass uses quality consensus.
+    assert client.review_calls == 8
     assert report.pages[0].status == "original_fallback"
     assert report.pages[0].attempts[-1].verification_categories == [
         "changed_layout",
