@@ -92,6 +92,10 @@ class AttemptRecord:
     effective_dpi: float | None = None
     accepted: bool = False
     error_type: str | None = None
+    verification_discrepancies: list[Discrepancy] = field(default_factory=list)
+    localized_quality_regions: list[tuple[float, float, float, float]] = field(default_factory=list)
+    committed_quality_regions: list[tuple[float, float, float, float]] = field(default_factory=list)
+    rejected_quality_regions: list[tuple[float, float, float, float]] = field(default_factory=list)
 
 
 @dataclass(slots=True)

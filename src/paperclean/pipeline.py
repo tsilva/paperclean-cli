@@ -150,6 +150,7 @@ def _verification_accepts(
     tolerated_categories: frozenset[str] = frozenset(),
     confirm_rejections: bool = False,
     quality_consensus: bool = False,
+    confirm_quality_rejections: bool = True,
     register_views: bool = True,
     collect_all_views: bool = False,
 ) -> tuple[bool, list[Discrepancy]]:
@@ -187,7 +188,9 @@ def _verification_accepts(
                     item for item in quality_verdicts if _quality_only_rejection(item)
                 ]
                 verdict = rejected_quality[0] if rejected_quality else quality_verdicts[-1]
-        elif _quality_only_rejection(verdict) or (confirm_rejections and not verdict.accepted):
+        elif (confirm_quality_rejections and _quality_only_rejection(verdict)) or (
+            confirm_rejections and not verdict.accepted and not _quality_only_rejection(verdict)
+        ):
             verdict = _review_view(
                 client,
                 source_view,
@@ -250,6 +253,67 @@ def _verification_accepts(
             if not collect_all_views:
                 return False, discrepancies
     return not rejected, discrepancies
+
+
+def _incremental_content_accepts(
+    client: ModelClient,
+    source: Image.Image,
+    candidate: Image.Image,
+    region: tuple[float, float, float, float],
+    *,
+    tolerated_categories: frozenset[str] = frozenset(),
+) -> bool:
+    """Check one incremental repair without repeating full quality consensus.
+
+    The initial verification has already localized scan-quality defects. During a
+    repair transaction, only newly changed content can invalidate the proposal;
+    scanner quality is adjudicated once after the bounded queue is exhausted.
+    Review the full page plus the registered verification tile with the greatest
+    overlap, confirming a content rejection once to avoid one noisy judgment.
+    """
+
+    def content_matches(verdict: ReviewVerdict) -> bool:
+        return verdict.content_match or (
+            bool(verdict.discrepancies)
+            and all(item.category in tolerated_categories for item in verdict.discrepancies)
+        )
+
+    view_pairs = registered_review_pairs(source, candidate)
+    views: list[tuple[Image.Image, Image.Image, str]] = [
+        (view_pairs[0][0], view_pairs[0][1], "full page")
+    ]
+    boxes = review_boxes(candidate.size)
+    left, top, right, bottom = region
+
+    def overlap_area(box: tuple[int, int, int, int]) -> float:
+        box_left, box_top, box_right, box_bottom = box
+        normalized = (
+            box_left / candidate.width,
+            box_top / candidate.height,
+            box_right / candidate.width,
+            box_bottom / candidate.height,
+        )
+        return max(0.0, min(right, normalized[2]) - max(left, normalized[0])) * max(
+            0.0,
+            min(bottom, normalized[3]) - max(top, normalized[1]),
+        )
+
+    tile_index = max(range(len(boxes)), key=lambda index: overlap_area(boxes[index]))
+    views.append(
+        (
+            view_pairs[tile_index + 1][0],
+            view_pairs[tile_index + 1][1],
+            f"region {tile_index + 1} of 4",
+        )
+    )
+    for source_view, candidate_view, view_name in views:
+        verdict = _review_view(client, source_view, candidate_view, view_name=view_name)
+        if content_matches(verdict):
+            continue
+        confirmed = _review_view(client, source_view, candidate_view, view_name=view_name)
+        if not content_matches(confirmed):
+            return False
+    return True
 
 
 _SOURCE_PRESERVED_CATEGORIES = {
@@ -584,6 +648,18 @@ def _repair_authored_hole_regions(
                     proposed_candidate.crop(crop_box),
                     view_name="region 1 of 1",
                 )
+                if not local_verdict.content_match:
+                    # A single vision judgment can be noisy around deliberately
+                    # reconstructed, previously occluded strokes. Confirm a local
+                    # rejection once before discarding the generated crop. This
+                    # does not publish the candidate: deterministic checks and the
+                    # full registered page comparison remain mandatory afterward.
+                    local_verdict = _review_view(
+                        client,
+                        source.crop(crop_box),
+                        proposed_candidate.crop(crop_box),
+                        view_name="region 1 of 1",
+                    )
                 if local_verdict.content_match:
                     assisted_recreation = proposed_recreation
                     break
@@ -666,7 +742,8 @@ def _try_source_first_cleanup(
         candidate,
         tolerated_categories=tolerated_categories,
         confirm_rejections=True,
-        quality_consensus=True,
+        quality_consensus=False,
+        confirm_quality_rejections=False,
         collect_all_views=True,
     )
     evidence_regions = [
@@ -706,89 +783,81 @@ def _try_source_first_cleanup(
         and discrepancies
         and all(item.category == "scanner_quality" for item in discrepancies)
     ):
-        quality_proposals = 0
-        for _quality_repair in range(_MAX_SCAN_QUALITY_REPAIRS):
-            quality_regions = [
-                region
-                for item in discrepancies
-                if (region := _localized_quality_repair_region([item])) is not None
-            ]
-            quality_regions = list(dict.fromkeys(quality_regions))[:4]
-            if not quality_regions:
-                break
-            committed_repair = False
-            for quality_region in quality_regions:
-                if quality_proposals >= _MAX_SCAN_QUALITY_REPAIRS:
-                    break
-                quality_proposals += 1
-                # Treat every verifier box as an independent transaction. A
-                # single unsafe edge box must not cause unrelated, safe fold or
-                # scanner-rail repairs from the same verdict to be discarded.
-                # Conversely, never commit a whole batch when only the combined
-                # page was reviewed: validate and semantically review each change
-                # against the current accepted-content candidate on its own.
-                deterministic_recreation = erase_contained_edge_artifacts(
+        quality_regions = [
+            region
+            for item in discrepancies
+            if (region := _localized_quality_repair_region([item])) is not None
+        ]
+        quality_regions = list(dict.fromkeys(quality_regions))[:_MAX_SCAN_QUALITY_REPAIRS]
+        record.localized_quality_regions = quality_regions
+        committed_repair = False
+        proposed_tolerated_categories = _MODEL_ASSISTED_CLEANUP_TOLERATED_CATEGORIES
+        if has_preserved_photographic_regions(source):
+            proposed_tolerated_categories = proposed_tolerated_categories | {"changed_diagram"}
+        for quality_region in quality_regions:
+            # Each region is an independent transaction against the current
+            # content-safe candidate. Do not rediscover quality boxes after every
+            # commit; the original all-view verdict is the bounded repair queue.
+            deterministic_recreation = erase_contained_edge_artifacts(
+                recreation,
+                quality_region,
+            )
+            deterministic_recreation = erase_localized_pale_artifacts(
+                deterministic_recreation,
+                quality_region,
+            )
+            if pixel_sha256(deterministic_recreation) != pixel_sha256(recreation):
+                proposed_recreation = deterministic_recreation
+            else:
+                repair_context = _expanded_quality_repair_context(quality_region)
+                proposed_recreation = repair_region(
                     recreation,
-                    quality_region,
+                    recreation,
+                    repair_context,
+                    client=client,
+                    max_edge=settings.max_reference_edge,
+                    paste_region=quality_region,
                 )
-                deterministic_recreation = erase_localized_pale_artifacts(
-                    deterministic_recreation,
-                    quality_region,
-                )
-                if pixel_sha256(deterministic_recreation) != pixel_sha256(recreation):
-                    proposed_recreation = deterministic_recreation
-                else:
-                    repair_context = _expanded_quality_repair_context(quality_region)
-                    proposed_recreation = repair_region(
-                        recreation,
-                        recreation,
-                        repair_context,
-                        client=client,
-                        max_edge=settings.max_reference_edge,
-                        paste_region=quality_region,
-                    )
-                proposed_candidate = finalize_candidate(proposed_recreation)
-                proposed_deterministic = _validate_clean_candidate(
-                    source,
-                    proposed_candidate,
-                    min_effective_dpi=settings.min_effective_dpi,
-                    effective_dpi=source_page_dpi,
-                )
-                record.local_issues = proposed_deterministic.issues
-                if not proposed_deterministic.accepted:
-                    continue
-                proposed_tolerated_categories = _MODEL_ASSISTED_CLEANUP_TOLERATED_CATEGORIES
-                if has_preserved_photographic_regions(source):
-                    proposed_tolerated_categories = proposed_tolerated_categories | {
-                        "changed_diagram"
-                    }
-                proposed_accepted, proposed_discrepancies = _verification_accepts(
-                    client,
-                    source,
-                    proposed_candidate,
-                    tolerated_categories=proposed_tolerated_categories,
-                    confirm_rejections=True,
-                    quality_consensus=True,
-                    collect_all_views=True,
-                )
-                # Commit an incremental repair only when it introduces no content
-                # disagreement. A remaining localized quality warning can be
-                # handled by the next bounded pass; changed or missing content
-                # rejects only this transaction, not the verifier's other boxes.
-                if not proposed_accepted and any(
-                    item.category != "scanner_quality" for item in proposed_discrepancies
-                ):
-                    continue
-                recreation = proposed_recreation
-                candidate = proposed_candidate
-                accepted = proposed_accepted
-                discrepancies = proposed_discrepancies
-                record.strategy = "model_assisted_source_cleanup"
-                committed_repair = True
-                break
-            if accepted or not committed_repair or quality_proposals >= _MAX_SCAN_QUALITY_REPAIRS:
-                break
+            if pixel_sha256(proposed_recreation) == pixel_sha256(recreation):
+                record.rejected_quality_regions.append(quality_region)
+                continue
+            proposed_candidate = finalize_candidate(proposed_recreation)
+            proposed_deterministic = _validate_clean_candidate(
+                source,
+                proposed_candidate,
+                min_effective_dpi=settings.min_effective_dpi,
+                effective_dpi=source_page_dpi,
+            )
+            record.local_issues = proposed_deterministic.issues
+            if not proposed_deterministic.accepted:
+                record.rejected_quality_regions.append(quality_region)
+                continue
+            if not _incremental_content_accepts(
+                client,
+                source,
+                proposed_candidate,
+                quality_region,
+                tolerated_categories=proposed_tolerated_categories,
+            ):
+                record.rejected_quality_regions.append(quality_region)
+                continue
+            recreation = proposed_recreation
+            candidate = proposed_candidate
+            record.strategy = "model_assisted_source_cleanup"
+            record.committed_quality_regions.append(quality_region)
+            committed_repair = True
+        if committed_repair or not quality_regions:
+            accepted, discrepancies = _verification_accepts(
+                client,
+                source,
+                candidate,
+                tolerated_categories=proposed_tolerated_categories,
+                confirm_rejections=True,
+                quality_consensus=True,
+                collect_all_views=True,
+            )
     record.verification_categories = list(dict.fromkeys(item.category for item in discrepancies))
+    record.verification_discrepancies = list(discrepancies)
     record.accepted = accepted
     if not accepted:
         return None
@@ -1371,7 +1440,7 @@ def _core_manifest(report: DocumentReport) -> dict[str, object]:
 
 def _base_report(paths: OutputPaths, settings: Settings) -> DocumentReport:
     return DocumentReport(
-        schema_version=6,
+        schema_version=7,
         run_id=uuid4().hex,
         source=str(paths.source),
         output=str(paths.output),
