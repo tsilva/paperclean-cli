@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Rename the GitHub repository and PyPI distribution to `paperclean-cli` while
+  preserving the `paperclean` command and Python import package.
 - Add an AgentBridge backend that runs generation and mandatory structured
   five-view verification through an authenticated local Codex CLI. Include capability
   preflight, non-persistent requests, subscription call-count projections,

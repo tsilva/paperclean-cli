@@ -1,6 +1,6 @@
 ---
 name: build-release
-description: Build, tag, publish, monitor, or verify a PaperClean PyPI release. Use when the user asks to cut a release, publish paperclean, build release artifacts, invoke $build-release, or confirm that a version is live.
+description: Build, tag, publish, monitor, or verify a PaperClean PyPI release. Use when the user asks to cut a release, publish paperclean-cli, build release artifacts, invoke $build-release, or confirm that a version is live.
 ---
 
 # Build Release
@@ -39,7 +39,7 @@ scripts/release.py --to <MAJOR.MINOR.PATCH>
 The script requires an unused PyPI version and tag, promotes the Unreleased
 changelog, locks dependencies, runs formatting/lint/type/tests, builds exactly
 one universal wheel and one sdist, audits both, commits the release metadata,
-creates `paperclean-v<version>`, and atomically pushes the current branch and
+creates `paperclean-cli-v<version>`, and atomically pushes the current branch and
 tag. The artifact audit also installs the wheel in an isolated environment from
 the committed lock and invokes its CLI. Report the exact failed gate and stop
 if any step fails.
@@ -47,7 +47,7 @@ if any step fails.
 3. Resolve the release commit and monitor only the matching workflow:
 
 ```bash
-release_sha="$(git rev-list -n 1 paperclean-v<version>)"
+release_sha="$(git rev-list -n 1 paperclean-cli-v<version>)"
 gh run list --workflow release.yml --commit "$release_sha" --limit 5 \
   --json databaseId,status,conclusion,event,headSha,url
 gh run watch <run-id> --exit-status
@@ -64,13 +64,13 @@ python .codex/skills/build-release/scripts/release_build.py \
 ```
 
 For post-publication verification, query
-`https://pypi.org/pypi/paperclean/<version>/json` until the release contains
-`paperclean-<version>-py3-none-any.whl` and
-`paperclean-<version>.tar.gz`. Also verify the GitHub Release exists for the
+`https://pypi.org/pypi/paperclean-cli/<version>/json` until the release contains
+`paperclean_cli-<version>-py3-none-any.whl` and
+`paperclean_cli-<version>.tar.gz`. Also verify the GitHub Release exists for the
 same tag.
 
 ## Completion
 
-Lead with `https://pypi.org/project/paperclean/<version>/`. Include the exact
+Lead with `https://pypi.org/project/paperclean-cli/<version>/`. Include the exact
 tag, workflow URL and conclusion, GitHub Release URL, and both distribution
 filenames. Do not report success before PyPI returns the files.

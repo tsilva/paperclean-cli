@@ -584,6 +584,42 @@ def align_candidate_to_source(source: Image.Image, candidate: Image.Image) -> Im
     return Image.fromarray(aligned, "RGB")
 
 
+def rotate_reading_orientation(source: Image.Image, degrees: int) -> Image.Image:
+    """Apply one orthogonal page rotation and contain it on the existing canvas."""
+    source = source.convert("RGB")
+    transpose = {
+        0: None,
+        90: Image.Transpose.ROTATE_90,
+        180: Image.Transpose.ROTATE_180,
+        270: Image.Transpose.ROTATE_270,
+    }
+    if degrees not in transpose:
+        raise ValueError("reading rotation must be 0, 90, 180, or 270 degrees")
+    method = transpose[degrees]
+    if method is None:
+        return source.copy()
+    rotated = source.transpose(method)
+    if rotated.size == source.size:
+        return rotated
+    scale = min(source.width / rotated.width, source.height / rotated.height)
+    contained = rotated.resize(
+        (
+            max(1, round(rotated.width * scale)),
+            max(1, round(rotated.height * scale)),
+        ),
+        Image.Resampling.LANCZOS,
+    )
+    canvas = Image.new("RGB", source.size, "white")
+    canvas.paste(
+        contained,
+        (
+            (source.width - contained.width) // 2,
+            (source.height - contained.height) // 2,
+        ),
+    )
+    return canvas
+
+
 def _clean_source(source: Image.Image) -> np.ndarray:
     pixels = np.asarray(source.convert("RGB"), dtype=np.float32)
     sigma = max(source.size) / 45
@@ -684,9 +720,8 @@ def _remove_low_information_edge_artifacts(pixels: np.ndarray) -> np.ndarray:
         touches_top = y <= height * 0.015
         touches_right = x + component_width >= width * 0.985
         touches_bottom = y + component_height >= height * 0.985
-        shallow = (
-            ((touches_top or touches_bottom) and component_height <= height * 0.08)
-            or ((touches_left or touches_right) and component_width <= width * 0.08)
+        shallow = ((touches_top or touches_bottom) and component_height <= height * 0.08) or (
+            (touches_left or touches_right) and component_width <= width * 0.08
         )
         if not shallow:
             continue
@@ -699,9 +734,7 @@ def _remove_low_information_edge_artifacts(pixels: np.ndarray) -> np.ndarray:
         component_y, component_x = np.where(component)
         if component_x.size < 3:
             continue
-        hull = cv2.convexHull(
-            np.column_stack((component_x, component_y)).astype(np.int32)
-        )
+        hull = cv2.convexHull(np.column_stack((component_x, component_y)).astype(np.int32))
         component_mask = np.zeros_like(removal)
         cv2.fillConvexPoly(component_mask, hull, 255)
         expansion = max(3, round(min(width, height) * 0.004))
@@ -723,7 +756,64 @@ def _remove_punch_holes(pixels: np.ndarray) -> np.ndarray:
     for center_x, center_y, radius, padding, touches_authored_ink in _punch_hole_candidates(result):
         if touches_authored_ink:
             continue
-        cv2.circle(result, (center_x, center_y), radius + padding, (255, 255, 255), thickness=-1)
+        result = _erase_punch_hole_preserving_nearby_ink(
+            result,
+            center_x,
+            center_y,
+            radius,
+            padding,
+        )
+    return result
+
+
+def _erase_punch_hole_preserving_nearby_ink(
+    pixels: np.ndarray,
+    center_x: int,
+    center_y: int,
+    radius: int,
+    padding: int,
+) -> np.ndarray:
+    """Whiten a blank punch and halo without clipping ink in its safety padding."""
+    original = pixels.copy()
+    result = pixels.copy()
+    gray = cv2.cvtColor(original, cv2.COLOR_RGB2GRAY)
+    authored = (gray < 180).astype(np.uint8)
+    _count, labels, _stats, centroids = cv2.connectedComponentsWithStats(
+        authored,
+        connectivity=8,
+    )
+    core = np.zeros_like(gray, dtype=np.uint8)
+    cv2.circle(core, (center_x, center_y), radius, 255, thickness=-1)
+    hole_label = int(labels[center_y, center_x])
+    if hole_label == 0:
+        labels_in_core = labels[(core > 0) & (labels > 0)]
+        if labels_in_core.size:
+            hole_label = int(np.bincount(labels_in_core).argmax())
+
+    erase = np.zeros_like(gray, dtype=np.uint8)
+    cv2.circle(erase, (center_x, center_y), radius + padding, 255, thickness=-1)
+    result[erase > 0] = 255
+
+    # The candidate gate considers only ink entering the actual hole core. A table
+    # border, glyph, or signature may still enter the extra halo padding. Restore
+    # every independently connected component there so the white repair cannot clip
+    # legitimate nearby evidence.
+    nearby_labels = np.unique(labels[(erase > 0) & (labels > 0)])
+    for nearby_label in nearby_labels:
+        if int(nearby_label) == hole_label:
+            continue
+        component = (labels == nearby_label).astype(np.uint8)
+        contained = not np.any((component > 0) & (erase == 0))
+        component_x, component_y = centroids[nearby_label]
+        centered_halo = np.hypot(component_x - center_x, component_y - center_y) <= radius * 0.25
+        if contained and centered_halo:
+            continue
+        protected = cv2.dilate(component, np.ones((3, 3), np.uint8))
+        protected_mask = (protected > 0) & (erase > 0)
+        result[protected_mask] = original[protected_mask]
+    # Independently segmented gray rim fragments are physical halo, not authored
+    # strokes. Remove only their pale pixels after restoring nearby dark content.
+    result[(erase > 0) & (gray >= 145)] = 255
     return result
 
 
@@ -769,13 +859,14 @@ def _punch_hole_candidates(
             if labels_in_disk.size:
                 hole_label = int(np.bincount(labels_in_disk).argmax())
         extent = radius + erase_padding
-        erase_disk = np.zeros_like(gray, dtype=np.uint8)
-        cv2.circle(erase_disk, (center_x, center_y), extent, 255, thickness=-1)
-        nearby_labels = np.unique(authored_labels[(erase_disk > 0) & (authored_labels > 0)])
+        core_disk = np.zeros_like(gray, dtype=np.uint8)
+        cv2.circle(core_disk, (center_x, center_y), radius, 255, thickness=-1)
+        nearby_labels = np.unique(authored_labels[(core_disk > 0) & (authored_labels > 0)])
         for nearby_label in nearby_labels:
             x, y, component_width, component_height, area = authored_stats[nearby_label]
             if int(nearby_label) != hole_label and area < max(4, round(radius**2 * 0.02)):
                 continue
+            component = authored_labels == nearby_label
             contained = (
                 x >= center_x - extent
                 and y >= center_y - extent
@@ -786,11 +877,62 @@ def _punch_hole_candidates(
             centered_hole_evidence = (
                 np.hypot(component_x - center_x, component_y - center_y) <= radius * 0.25
             )
+            outside_core = component & (core_disk == 0)
+            outside_core_fraction = int(np.count_nonzero(outside_core)) / area
+            if int(nearby_label) == hole_label and outside_core_fraction > 0.08:
+                outside_y, outside_x = np.where(outside_core)
+                distances = np.hypot(outside_x - center_x, outside_y - center_y)
+                direction_strength = float(
+                    np.hypot(
+                        np.mean((outside_x - center_x) / np.maximum(distances, 1)),
+                        np.mean((outside_y - center_y) / np.maximum(distances, 1)),
+                    )
+                )
+                if direction_strength > 0.45:
+                    # A glyph or rule can merge into the punch yet remain wholly
+                    # inside the erasure padding. Its directional protrusion is
+                    # authored evidence; symmetric rasterization around a round
+                    # punch is not.
+                    return True
             if not contained or (int(nearby_label) != hole_label and not centered_hole_evidence):
                 return True
         return False
 
     candidates: list[tuple[int, int, int, int, bool]] = []
+    relaxed_ring_candidates: list[tuple[int, int, int, int]] = []
+
+    # Hough circle search scales superlinearly with raster area. PDF pages rendered
+    # at 300 DPI are commonly 12+ megapixels, while punch geometry needs only a
+    # bounded working raster. Detect there, then map geometry back and make the
+    # authored-ink decision against the original full-resolution labels.
+    detection_scale = min(1.0, 1600 / max(width, height))
+    if detection_scale < 1.0:
+        detection_pixels = cv2.resize(
+            pixels,
+            (
+                max(1, round(width * detection_scale)),
+                max(1, round(height * detection_scale)),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+        detected = _punch_hole_candidates(detection_pixels)
+        for work_x, work_y, work_radius, work_padding, _work_touches in detected:
+            center_x = min(width - 1, max(0, round(work_x / detection_scale)))
+            center_y = min(height - 1, max(0, round(work_y / detection_scale)))
+            radius = max(1, round(work_radius / detection_scale))
+            erase_padding = max(1, round(work_padding / detection_scale))
+            if photographic_mask[center_y, center_x]:
+                continue
+            candidates.append(
+                (
+                    center_x,
+                    center_y,
+                    radius,
+                    erase_padding,
+                    touches_authored_ink(center_x, center_y, radius, erase_padding),
+                )
+            )
+        return candidates
 
     dark = (gray < 140).astype(np.uint8)
     component_count, _component_labels, component_stats, component_centroids = (
@@ -807,14 +949,14 @@ def _punch_hole_candidates(
         center_x, center_y = np.rint(component_centroids[label]).astype(int)
         radius = round((component_width + component_height) / 4)
         erase_padding = candidate_padding(radius)
-        if (
+        geometry_matches = (
             min_component_area <= area <= max_component_area
             and 0.65 <= aspect <= 1.55
-            and density >= 0.68
             and min_radius <= radius <= max_radius
             and in_side_margin(int(center_x), radius, padding)
             and not photographic_mask[int(center_y), int(center_x)]
-        ):
+        )
+        if geometry_matches and density >= 0.68:
             candidates.append(
                 (
                     int(center_x),
@@ -824,6 +966,8 @@ def _punch_hole_candidates(
                     touches_authored_ink(int(center_x), int(center_y), radius, erase_padding),
                 )
             )
+        elif geometry_matches and 0.20 <= density < 0.68:
+            relaxed_ring_candidates.append((int(center_x), int(center_y), radius, erase_padding))
 
     # A punch core merged into a text line can make its whole connected component
     # non-circular. Distance-transform maxima still reveal the thick round core,
@@ -873,19 +1017,35 @@ def _punch_hole_candidates(
         )
 
     blurred = cv2.medianBlur(gray, 5)
-    circles = cv2.HoughCircles(
-        blurred,
-        cv2.HOUGH_GRADIENT,
-        dp=1.2,
-        minDist=max(8, round(short_edge * 0.04)),
-        param1=100,
-        param2=14,
-        minRadius=min_radius,
-        maxRadius=max_radius,
-    )
-    if circles is None:
+    # Valid binder punches must fit wholly inside the outer ten percent. Running
+    # Hough over the document interior is wasteful and pathological on radiographs,
+    # ultrasound panels, plots, and other dense circular imagery. Search only two
+    # slightly wider side strips, then map right-strip coordinates back.
+    strip_width = min(width, max(1, round(width * 0.12)))
+    hough_candidates: list[tuple[int, int, int]] = []
+    for offset_x, strip in (
+        (0, blurred[:, :strip_width]),
+        (width - strip_width, blurred[:, width - strip_width :]),
+    ):
+        circles = cv2.HoughCircles(
+            strip,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=max(8, round(short_edge * 0.04)),
+            param1=100,
+            param2=14,
+            minRadius=min_radius,
+            maxRadius=max_radius,
+        )
+        if circles is None:
+            continue
+        hough_candidates.extend(
+            (int(center_x + offset_x), int(center_y), int(radius))
+            for center_x, center_y, radius in np.rint(circles[0]).astype(int)
+        )
+    if not hough_candidates:
         return candidates
-    for center_x, center_y, radius in np.rint(circles[0]).astype(int):
+    for center_x, center_y, radius in hough_candidates:
         if not (0 <= center_x < width and 0 <= center_y < height):
             continue
         erase_padding = candidate_padding(int(radius))
@@ -904,7 +1064,17 @@ def _punch_hole_candidates(
         if disk_area == 0:
             continue
         dark_fill = int(np.count_nonzero((gray < 140) & (disk > 0))) / disk_area
+        squared_distance = (xx - center_x) ** 2 + (yy - center_y) ** 2
+        annulus = (squared_distance >= (radius * 0.65) ** 2) & (squared_distance <= radius**2)
+        annulus_area = int(np.count_nonzero(annulus))
+        annulus_dark_fraction = (
+            int(np.count_nonzero((gray < 180) & annulus)) / annulus_area if annulus_area else 0.0
+        )
         if dark_fill < 0.70:
+            if dark_fill >= 0.30 and annulus_dark_fraction >= 0.70:
+                relaxed_ring_candidates.append(
+                    (int(center_x), int(center_y), int(radius), erase_padding)
+                )
             continue
         candidates.append(
             (
@@ -915,17 +1085,91 @@ def _punch_hole_candidates(
                 touches_authored_ink(int(center_x), int(center_y), int(radius), erase_padding),
             )
         )
+    # A white scanner-bed center can leave only a dark punched rim. A single
+    # outlined circle may be authored content, so promote this weaker shape only
+    # when another same-size ring is aligned at normal binder-hole spacing.
+    for index, (center_x, center_y, radius, erase_padding) in enumerate(relaxed_ring_candidates):
+        aligned = False
+        for other_index, (other_x, other_y, other_radius, _other_padding) in enumerate(
+            relaxed_ring_candidates
+        ):
+            if index == other_index:
+                continue
+            radius_ratio = radius / max(1, other_radius)
+            vertical_fraction = abs(center_y - other_y) / height
+            if (
+                0.75 <= radius_ratio <= 1.33
+                and abs(center_x - other_x) <= max(radius, other_radius) * 0.6
+                and 0.18 <= vertical_fraction <= 0.40
+            ):
+                aligned = True
+                break
+        if not aligned:
+            continue
+        if any(
+            np.hypot(center_x - existing_x, center_y - existing_y) <= max(radius, existing_radius)
+            for existing_x, existing_y, existing_radius, _padding, _touches in candidates
+        ):
+            continue
+        candidates.append(
+            (
+                center_x,
+                center_y,
+                radius,
+                erase_padding,
+                touches_authored_ink(center_x, center_y, radius, erase_padding),
+            )
+        )
     return candidates
+
+
+def _merge_punch_hole_candidates(
+    *groups: list[tuple[int, int, int, int, bool]],
+) -> list[tuple[int, int, int, int, bool]]:
+    """Merge the same physical holes detected before and after tone cleanup."""
+    merged: list[tuple[int, int, int, int, bool]] = []
+    for group in groups:
+        for candidate in group:
+            center_x, center_y, radius, padding, touches = candidate
+            duplicate_index = next(
+                (
+                    index
+                    for index, (other_x, other_y, other_radius, _padding, _touches) in enumerate(
+                        merged
+                    )
+                    if np.hypot(center_x - other_x, center_y - other_y) <= max(radius, other_radius)
+                ),
+                None,
+            )
+            if duplicate_index is None:
+                merged.append(candidate)
+                continue
+            existing = merged[duplicate_index]
+            geometry = candidate if radius > existing[2] else existing
+            merged[duplicate_index] = (
+                geometry[0],
+                geometry[1],
+                geometry[2],
+                max(padding, existing[3]),
+                touches or existing[4],
+            )
+    return merged
 
 
 def authored_punch_hole_regions(
     source: Image.Image,
 ) -> list[tuple[float, float, float, float]]:
     """Find punch holes that obscure nearby authored ink and merit cautious restoration."""
-    pixels = _remove_paper_tone(_clean_source(source.convert("RGB")))
+    source = source.convert("RGB")
+    raw_pixels = np.asarray(source)
+    pixels = _remove_paper_tone(_clean_source(source))
     height, width = pixels.shape[:2]
     regions: list[tuple[float, float, float, float]] = []
-    for center_x, center_y, radius, padding, touches_authored_ink in _punch_hole_candidates(pixels):
+    candidates = _merge_punch_hole_candidates(
+        _punch_hole_candidates(raw_pixels),
+        _punch_hole_candidates(pixels),
+    )
+    for center_x, center_y, radius, padding, touches_authored_ink in candidates:
         if not touches_authored_ink:
             continue
         vertical_context = max(radius * 3, round(height * 0.025))
@@ -939,6 +1183,367 @@ def authored_punch_hole_regions(
         y2 = min(height, center_y + vertical_context)
         regions.append((x1 / width, y1 / height, x2 / width, y2 / height))
     return regions
+
+
+def residual_punch_hole_regions(
+    source: Image.Image,
+    candidate: Image.Image,
+) -> list[tuple[float, float, float, float]]:
+    """Return punch remnants whose geometry survives in a candidate.
+
+    Semantic reviewers can overlook a small binder hole, especially when it has
+    swallowed part of a nearby glyph. Use source punches as positional and scale
+    priors so ordinary circles elsewhere in the document do not become a blanket
+    rejection signal. Generated pages may shift a physical hole slightly or turn
+    it into a filled semicircle; the guided component fallback catches that case
+    while staying bounded to the source hole's side-margin neighborhood.
+    """
+
+    def detected(image: Image.Image) -> list[tuple[int, int, int, int, bool]]:
+        image = image.convert("RGB")
+        width, height = image.size
+        scale = min(1.0, 1600 / max(width, height))
+        work = (
+            image.resize(
+                (max(1, round(width * scale)), max(1, round(height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+            if scale < 1.0
+            else image
+        )
+        raw_pixels = np.asarray(work)
+        cleaned_pixels = _remove_paper_tone(_clean_source(work))
+        candidates = _merge_punch_hole_candidates(
+            _punch_hole_candidates(raw_pixels),
+            _punch_hole_candidates(cleaned_pixels),
+        )
+        if scale == 1.0:
+            return candidates
+        return [
+            (
+                round(center_x / scale),
+                round(center_y / scale),
+                max(1, round(radius / scale)),
+                max(1, round(padding / scale)),
+                touches_authored_ink,
+            )
+            for center_x, center_y, radius, padding, touches_authored_ink in candidates
+        ]
+
+    source = source.convert("RGB")
+    candidate = candidate.convert("RGB")
+    source_width, source_height = source.size
+    candidate_width, candidate_height = candidate.size
+    source_short_edge = min(source_width, source_height)
+    candidate_short_edge = min(candidate_width, candidate_height)
+    source_candidates = detected(source)
+    if not source_candidates:
+        return []
+    candidate_candidates = detected(candidate)
+    candidate_scale = min(1.0, 1600 / max(candidate_width, candidate_height))
+    candidate_work = (
+        candidate.resize(
+            (
+                max(1, round(candidate_width * candidate_scale)),
+                max(1, round(candidate_height * candidate_scale)),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+        if candidate_scale < 1.0
+        else candidate
+    )
+    candidate_gray = cv2.cvtColor(np.asarray(candidate_work), cv2.COLOR_RGB2GRAY)
+    candidate_dark = (candidate_gray < 180).astype(np.uint8)
+    (
+        component_count,
+        _component_labels,
+        component_stats,
+        component_centroids,
+    ) = cv2.connectedComponentsWithStats(candidate_dark, connectivity=8)
+    work_height, work_width = candidate_gray.shape
+    work_short_edge = min(work_width, work_height)
+
+    def guided_component_remnant(
+        source_x_fraction: float,
+        source_y_fraction: float,
+        source_radius_fraction: float,
+    ) -> tuple[int, int, int, int] | None:
+        """Find a shifted filled circle fragment near one confirmed source punch."""
+        expected_radius = max(3.0, source_radius_fraction * work_short_edge)
+        expected_x = source_x_fraction * work_width
+        expected_y = source_y_fraction * work_height
+        maximum_distance = max(
+            work_short_edge * 0.012,
+            expected_radius * 3.0,
+        )
+        matches: list[tuple[float, int, int, int, int]] = []
+        for label in range(1, component_count):
+            _x, _y, component_width, component_height, area = component_stats[label]
+            if component_width == 0 or component_height == 0:
+                continue
+            center_x, center_y = component_centroids[label]
+            if min(center_x, work_width - center_x) > work_width * 0.12:
+                continue
+            distance = float(np.hypot(center_x - expected_x, center_y - expected_y))
+            if distance > maximum_distance:
+                continue
+            aspect = component_width / component_height
+            density = area / (component_width * component_height)
+            expected_disk_area = np.pi * expected_radius**2
+            if not (
+                expected_radius <= component_width <= expected_radius * 3.0
+                and expected_radius * 0.60 <= component_height <= expected_radius * 3.0
+                and expected_disk_area * 0.30 <= area <= expected_disk_area * 3.0
+                and 0.40 <= aspect <= 2.50
+                and density >= 0.40
+            ):
+                continue
+            radius = max(component_width, component_height) / 2
+            padding = max(2.0, radius * 0.40)
+            matches.append(
+                (
+                    distance,
+                    round(center_x / candidate_scale),
+                    round(center_y / candidate_scale),
+                    max(1, round(radius / candidate_scale)),
+                    max(1, round(padding / candidate_scale)),
+                )
+            )
+        if not matches:
+            return None
+        _distance, center_x, center_y, radius, padding = min(matches)
+        return center_x, center_y, radius, padding
+
+    residual_regions: list[tuple[float, float, float, float]] = []
+    for source_x, source_y, source_radius, _source_padding, _source_touches in source_candidates:
+        source_x_fraction = source_x / source_width
+        source_y_fraction = source_y / source_height
+        source_radius_fraction = source_radius / source_short_edge
+        matching_candidates = [
+            (candidate_x, candidate_y, candidate_radius, candidate_padding)
+            for candidate_x, candidate_y, candidate_radius, candidate_padding, _touches in (
+                candidate_candidates
+            )
+            if np.hypot(
+                source_x_fraction - candidate_x / candidate_width,
+                source_y_fraction - candidate_y / candidate_height,
+            )
+            <= max(
+                0.012,
+                1.75 * source_radius_fraction,
+                1.75 * candidate_radius / candidate_short_edge,
+            )
+            and 0.45 <= (candidate_radius / candidate_short_edge) / source_radius_fraction <= 2.20
+        ]
+        matched = (
+            min(
+                matching_candidates,
+                key=lambda item: np.hypot(
+                    source_x_fraction - item[0] / candidate_width,
+                    source_y_fraction - item[1] / candidate_height,
+                ),
+            )
+            if matching_candidates
+            else guided_component_remnant(
+                source_x_fraction,
+                source_y_fraction,
+                source_radius_fraction,
+            )
+        )
+        if matched is None:
+            continue
+        candidate_x, candidate_y, candidate_radius, candidate_padding = matched
+        extent = candidate_radius + candidate_padding
+        residual_regions.append(
+            (
+                max(0, candidate_x - extent) / candidate_width,
+                max(0, candidate_y - extent) / candidate_height,
+                min(candidate_width, candidate_x + extent) / candidate_width,
+                min(candidate_height, candidate_y + extent) / candidate_height,
+            )
+        )
+    return residual_regions
+
+
+def erase_residual_punch_hole_regions(
+    candidate: Image.Image,
+    regions: Sequence[tuple[float, float, float, float]],
+) -> Image.Image:
+    """Erase tight residual-hole footprints while preserving nearby ink components.
+
+    The regions come from :func:`residual_punch_hole_regions`, so they are already
+    source-guided physical-defect footprints rather than arbitrary dark circles.
+    This is useful after a full-page recreation has restored adjacent text but
+    reproduced or shifted the now-isolated punch remnant. Semantic verification
+    remains responsible for rejecting any candidate where obscured ink is still
+    missing.
+    """
+    result = np.asarray(candidate.convert("RGB")).copy()
+    height, width = result.shape[:2]
+    for left, top, right, bottom in regions:
+        center_x = round((left + right) * width / 2)
+        center_y = round((top + bottom) * height / 2)
+        half_width = (right - left) * width / 2
+        half_height = (bottom - top) * height / 2
+        extent = max(2, round(max(half_width, half_height)))
+        # Residual regions use the same radius + 40% halo convention as punch
+        # detection. Recover that split so nearby independently connected glyphs
+        # are restored by the ink-preserving eraser.
+        radius = max(1, round(extent / 1.40))
+        padding = max(1, extent - radius)
+        center_x = max(0, min(width - 1, center_x))
+        center_y = max(0, min(height - 1, center_y))
+        result = _erase_punch_hole_preserving_nearby_ink(
+            result,
+            center_x,
+            center_y,
+            radius,
+            padding,
+        )
+    return Image.fromarray(result, "RGB")
+
+
+def erase_contained_edge_artifacts(
+    candidate: Image.Image,
+    region: tuple[float, float, float, float],
+) -> Image.Image:
+    """Whiten only components wholly contained in a small outer-margin region.
+
+    This is a conservative response to a verifier-localized scanner-quality alert.
+    Components that cross the region boundary may be footer text, rules, or marks
+    and are preserved. Non-edge and broad regions are returned unchanged; semantic
+    verification must still approve any changed page.
+    """
+    left, top, right, bottom = region
+    region_width = right - left
+    region_height = bottom - top
+    shallow_edge = (
+        (top <= 0.05 and region_height <= 0.20)
+        or (bottom >= 0.95 and region_height <= 0.20)
+        or (left <= 0.001 and region_width <= 0.08)
+        or (right >= 0.999 and region_width <= 0.08)
+    )
+    if (
+        not shallow_edge
+        or region_width <= 0
+        or region_height <= 0
+        or region_width > 0.55
+        or region_height > 0.20
+        or region_width * region_height > 0.08
+    ):
+        return candidate.convert("RGB")
+
+    pixels = np.asarray(candidate.convert("RGB")).copy()
+    height, width = pixels.shape[:2]
+    x1 = max(0, min(width - 1, round(left * width)))
+    y1 = max(0, min(height - 1, round(top * height)))
+    x2 = max(x1 + 1, min(width, round(right * width)))
+    y2 = max(y1 + 1, min(height, round(bottom * height)))
+    gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
+    foreground = (gray < 250).astype(np.uint8)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        foreground,
+        connectivity=8,
+    )
+    hsv = cv2.cvtColor(pixels, cv2.COLOR_RGB2HSV)
+    removal = np.zeros_like(gray, dtype=np.uint8)
+    region_area = (x2 - x1) * (y2 - y1)
+    intersecting_labels = np.unique(labels[y1:y2, x1:x2])
+    for label in intersecting_labels:
+        if label == 0 or label >= count:
+            continue
+        x, y, component_width, component_height, area = stats[label]
+        contained = x >= x1 and y >= y1 and x + component_width <= x2 and y + component_height <= y2
+        if not contained or area > region_area * 0.45:
+            continue
+        component = labels == label
+        if np.any(hsv[:, :, 1][component] >= 45):
+            continue
+        component_mask = component.astype(np.uint8)
+        component_mask = cv2.dilate(component_mask, np.ones((3, 3), np.uint8))
+        component_mask[:y1, :] = 0
+        component_mask[y2:, :] = 0
+        component_mask[:, :x1] = 0
+        component_mask[:, x2:] = 0
+        removal[component_mask > 0] = 255
+    if not np.any(removal):
+        return candidate.convert("RGB")
+    pixels[removal > 0] = 255
+    return Image.fromarray(pixels, "RGB")
+
+
+def erase_localized_pale_artifacts(
+    candidate: Image.Image,
+    region: tuple[float, float, float, float],
+) -> Image.Image:
+    """Erase long neutral defect traces inside a verifier-localized thin strip.
+
+    The operation deliberately preserves saturated marks and every dark ink core.
+    It removes only lighter neutral pixels that participate in a long horizontal or
+    vertical structure, which covers fold/shadow traces without globally searching
+    for page rules. A full semantic comparison still decides whether the proposal
+    may be committed.
+    """
+    left, top, right, bottom = region
+    region_width = right - left
+    region_height = bottom - top
+    horizontal = region_height <= 0.12 and region_width >= 0.20
+    vertical = region_width <= 0.12 and region_height >= 0.20
+    if (
+        region_width <= 0
+        or region_height <= 0
+        or region_width * region_height > 0.15
+        or not (horizontal or vertical)
+    ):
+        return candidate.convert("RGB")
+
+    pixels = np.asarray(candidate.convert("RGB")).copy()
+    height, width = pixels.shape[:2]
+    x1 = max(0, min(width - 1, round(left * width)))
+    y1 = max(0, min(height - 1, round(top * height)))
+    x2 = max(x1 + 1, min(width, round(right * width)))
+    y2 = max(y1 + 1, min(height, round(bottom * height)))
+    crop = pixels[y1:y2, x1:x2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    # Preserve black/dark authored strokes and colored pen/stamp pixels. The
+    # source-preserving cleanup maps ordinary paper to white, leaving pale neutral
+    # folds and scanner shadows in this deliberately narrow intensity interval.
+    neutral = ((gray >= 80) & (gray < 250) & (hsv[:, :, 1] < 30)).astype(np.uint8)
+    if horizontal:
+        join_length = max(5, round(crop.shape[1] * 0.015))
+        support_length = max(25, round(crop.shape[1] * 0.04))
+        joined = cv2.morphologyEx(
+            neutral,
+            cv2.MORPH_CLOSE,
+            np.ones((3, join_length), np.uint8),
+        )
+        support = cv2.morphologyEx(
+            joined,
+            cv2.MORPH_OPEN,
+            np.ones((1, support_length), np.uint8),
+        )
+        support = cv2.dilate(support, np.ones((9, 11), np.uint8))
+    else:
+        join_length = max(5, round(crop.shape[0] * 0.015))
+        support_length = max(25, round(crop.shape[0] * 0.04))
+        joined = cv2.morphologyEx(
+            neutral,
+            cv2.MORPH_CLOSE,
+            np.ones((join_length, 3), np.uint8),
+        )
+        support = cv2.morphologyEx(
+            joined,
+            cv2.MORPH_OPEN,
+            np.ones((support_length, 1), np.uint8),
+        )
+        support = cv2.dilate(support, np.ones((11, 9), np.uint8))
+    removal = (neutral > 0) & (support > 0)
+    if not np.any(removal):
+        return candidate.convert("RGB")
+    crop[removal] = 255
+    pixels[y1:y2, x1:x2] = crop
+    return Image.fromarray(pixels, "RGB")
 
 
 def _page_skew_angle(pixels: np.ndarray) -> float | None:
@@ -1094,10 +1699,13 @@ def _photographic_region_mask(pixels: np.ndarray) -> np.ndarray:
         )
         if touches_page_edge:
             component_gray = gray[y : y + component_height, x : x + component_width]
-            component_pixels = broad_shading[
-                y : y + component_height,
-                x : x + component_width,
-            ] > 0
+            component_pixels = (
+                broad_shading[
+                    y : y + component_height,
+                    x : x + component_width,
+                ]
+                > 0
+            )
             sobel_x = cv2.Sobel(component_gray, cv2.CV_32F, 1, 0)
             sobel_y = cv2.Sobel(component_gray, cv2.CV_32F, 0, 1)
             internal_edge_fraction = float(
@@ -1106,23 +1714,49 @@ def _photographic_region_mask(pixels: np.ndarray) -> np.ndarray:
             if internal_edge_fraction < 0.06:
                 continue
         component = (shade_labels == label).astype(np.uint8)
-        if not touches_page_edge and area / box_area >= 0.80:
+        dense_bounded_panel = not touches_page_edge and area / box_area >= 0.80
+        if dense_bounded_panel:
             # A dense, bounded rectangular component is an authored form panel.
-            # Preserve its entire bounding box so illumination gradients cannot
-            # split it into polygonal fragments that resemble a redaction.
+            # Refine its bounding box against the original broad-tone threshold:
+            # morphology can move a true panel edge inward by a few pixels, while
+            # blind dilation copies a colored paper seam outside the panel.
+            support = max(5, round(min(width, height) * 0.004))
+            search_x1 = max(0, x - support)
+            search_y1 = max(0, y - support)
+            search_x2 = min(width, x + component_width + support)
+            search_y2 = min(height, y + component_height + support)
+            column_fraction = np.mean(
+                shaded[y : y + component_height, search_x1:search_x2] > 0,
+                axis=0,
+            )
+            panel_columns = np.flatnonzero(column_fraction >= 0.50)
+            refined_x1 = search_x1 + int(panel_columns[0]) if panel_columns.size else x
+            refined_x2 = (
+                search_x1 + int(panel_columns[-1]) + 1
+                if panel_columns.size
+                else x + component_width
+            )
+            row_fraction = np.mean(
+                shaded[search_y1:search_y2, refined_x1:refined_x2] > 0,
+                axis=1,
+            )
+            panel_rows = np.flatnonzero(row_fraction >= 0.50)
+            refined_y1 = search_y1 + int(panel_rows[0]) if panel_rows.size else y
+            refined_y2 = (
+                search_y1 + int(panel_rows[-1]) + 1 if panel_rows.size else y + component_height
+            )
             component.fill(0)
-            component[y : y + component_height, x : x + component_width] = 255
+            component[refined_y1:refined_y2, refined_x1:refined_x2] = 255
         else:
             component_y, component_x = np.where(component > 0)
             if component_x.size < 3:
                 continue
-            hull = cv2.convexHull(
-                np.column_stack((component_x, component_y)).astype(np.int32)
-            )
+            hull = cv2.convexHull(np.column_stack((component_x, component_y)).astype(np.int32))
             component.fill(0)
             cv2.fillConvexPoly(component, hull, 255)
-        dilation = max(5, round(min(width, height) * 0.004))
-        component = cv2.dilate(component, np.ones((dilation, dilation), np.uint8))
+        if not dense_bounded_panel:
+            dilation = max(5, round(min(width, height) * 0.004))
+            component = cv2.dilate(component, np.ones((dilation, dilation), np.uint8))
         result[component > 0] = 255
     return result
 
@@ -1132,15 +1766,56 @@ def has_preserved_photographic_regions(source: Image.Image) -> bool:
     return bool(np.any(_photographic_region_mask(np.asarray(source.convert("RGB")))))
 
 
+def regions_are_preserved_visual_panels(
+    source: Image.Image,
+    candidate: Image.Image,
+    regions: Sequence[tuple[float, float, float, float]],
+) -> bool:
+    """Confirm explicit review regions are authored panels in both page versions."""
+    if not regions or source.size != candidate.size:
+        return False
+    scale = min(1.0, 1600 / max(source.size))
+
+    def working_pixels(image: Image.Image) -> np.ndarray:
+        image = image.convert("RGB")
+        if scale < 1.0:
+            image = image.resize(
+                (
+                    max(1, round(image.width * scale)),
+                    max(1, round(image.height * scale)),
+                ),
+                Image.Resampling.LANCZOS,
+            )
+        return np.asarray(image)
+
+    source_mask = _photographic_region_mask(working_pixels(source))
+    candidate_mask = _photographic_region_mask(working_pixels(candidate))
+    height, width = source_mask.shape
+    for left, top, right, bottom in regions:
+        x1 = max(0, min(width, round(left * width)))
+        y1 = max(0, min(height, round(top * height)))
+        x2 = max(0, min(width, round(right * width)))
+        y2 = max(0, min(height, round(bottom * height)))
+        if x2 <= x1 or y2 <= y1:
+            return False
+        source_region = source_mask[y1:y2, x1:x2]
+        candidate_region = candidate_mask[y1:y2, x1:x2]
+        if float(np.mean(source_region > 0)) < 0.95 or float(np.mean(candidate_region > 0)) < 0.95:
+            return False
+    return True
+
+
 def source_preserving_cleanup(source: Image.Image) -> Image.Image:
     """Whiten and sharpen a scan without synthesizing or rewriting its content."""
     source_pixels = np.asarray(source.convert("RGB"))
     photographic_mask = _photographic_region_mask(source_pixels)
     cleaned = _clean_source(source.convert("RGB"))
     cleaned = _remove_paper_tone(cleaned)
-    for center_x, center_y, radius, padding, touches_authored_ink in _punch_hole_candidates(
-        cleaned
-    ):
+    punch_holes = _merge_punch_hole_candidates(
+        _punch_hole_candidates(source_pixels),
+        _punch_hole_candidates(cleaned),
+    )
+    for center_x, center_y, radius, padding, touches_authored_ink in punch_holes:
         if not touches_authored_ink:
             cv2.circle(
                 photographic_mask,
@@ -1150,6 +1825,16 @@ def source_preserving_cleanup(source: Image.Image) -> Image.Image:
                 thickness=-1,
             )
     cleaned = _remove_scanner_borders(cleaned)
+    for center_x, center_y, radius, padding, touches_authored_ink in punch_holes:
+        if touches_authored_ink:
+            continue
+        cleaned = _erase_punch_hole_preserving_nearby_ink(
+            cleaned,
+            center_x,
+            center_y,
+            radius,
+            padding,
+        )
     angle = _page_skew_angle(cleaned)
     cleaned = _rotate_page(cleaned, angle)
     cleaned = _remove_paper_tone(cleaned)
@@ -1203,9 +1888,7 @@ def photographed_page_cleanup(source: Image.Image) -> Image.Image:
     # normalize themselves away.
     source_u8 = estimation_pixels.astype(np.uint8)
     source_gray = cv2.cvtColor(source_u8, cv2.COLOR_RGB2GRAY)
-    source_chroma = source_u8.max(axis=2).astype(np.int16) - source_u8.min(axis=2).astype(
-        np.int16
-    )
+    source_chroma = source_u8.max(axis=2).astype(np.int16) - source_u8.min(axis=2).astype(np.int16)
     source_support = ((source_gray < 252) | (source_chroma > 4)).astype(np.float32)
     blurred_support = cv2.GaussianBlur(source_support, (0, 0), sigmaX=sigma, sigmaY=sigma)
     weighted_background = cv2.GaussianBlur(
@@ -1242,10 +1925,9 @@ def photographed_page_cleanup(source: Image.Image) -> Image.Image:
         else local_background_estimate
     )
     local_contrast = local_background - gray
-    authored = (
-        (gray < 120)
-        | ((chroma > 16) & (gray < 225) & (local_contrast > 6))
-    ).astype(np.uint8)
+    authored = ((gray < 120) | ((chroma > 16) & (gray < 225) & (local_contrast > 6))).astype(
+        np.uint8
+    )
     # Remove isolated camera noise but retain small punctuation and antialiased edges
     # around genuine connected strokes.
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(authored, connectivity=8)
@@ -1278,10 +1960,13 @@ def photographed_page_cleanup(source: Image.Image) -> Image.Image:
     protected_width = max(3, round(min(source.size) * 0.006))
     if protected_width % 2 == 0:
         protected_width += 1
-    authored_support = cv2.dilate(
-        retained,
-        np.ones((protected_width, protected_width), np.uint8),
-    ) > 0
+    authored_support = (
+        cv2.dilate(
+            retained,
+            np.ones((protected_width, protected_width), np.uint8),
+        )
+        > 0
+    )
     # Fingers and hands leaking through a concave page mask are characteristically
     # broad, warm-colored blobs at the rectified canvas edge. Remove only connected
     # warm components which touch that edge; red stamps and annotations elsewhere on
@@ -1338,18 +2023,17 @@ def photographed_page_cleanup(source: Image.Image) -> Image.Image:
         & (result_hsv[:, :, 1] >= 20)
         & (result_gray < 250)
     ).astype(np.uint8)
-    cool_support = cv2.dilate(
-        cool_authored,
-        np.ones((warm_dilation, warm_dilation), np.uint8),
-    ) > 0
+    cool_support = (
+        cv2.dilate(
+            cool_authored,
+            np.ones((warm_dilation, warm_dilation), np.uint8),
+        )
+        > 0
+    )
     # Dilation may touch nearby blue ink or neutral black print. Delete the warm
     # component itself and only its pale halo; do not erase dark non-warm glyphs.
-    warm_delete = (
-        (warm_removal > 0)
-        & (
-            ((warm_capture > 0) & (result_gray >= 100))
-            | ((result_gray >= 145) & ~cool_support)
-        )
+    warm_delete = (warm_removal > 0) & (
+        ((warm_capture > 0) & (result_gray >= 100)) | ((result_gray >= 145) & ~cool_support)
     )
     result[warm_delete] = 255
     # Remove the low-saturation tan illumination fringe that remains around a
@@ -1385,9 +2069,8 @@ def photographed_page_cleanup(source: Image.Image) -> Image.Image:
     neutral_removal = np.zeros_like(neutral_seed)
     for label in range(1, count):
         x, y, component_width, component_height, area = stats[label]
-        touches_corner = (
-            (x <= width * 0.08 or x + component_width >= width * 0.92)
-            and (y <= height * 0.08 or y + component_height >= height * 0.92)
+        touches_corner = (x <= width * 0.08 or x + component_width >= width * 0.92) and (
+            y <= height * 0.08 or y + component_height >= height * 0.92
         )
         if touches_corner and area >= max(64, round(result_gray.size * 0.00008)):
             neutral_removal[labels == label] = 1
@@ -1697,8 +2380,9 @@ def repair_region(
     client: ImageGenerator,
     max_edge: int,
     prompt: str = REGIONAL_REPAIR_PROMPT,
+    paste_region: tuple[float, float, float, float] | None = None,
 ) -> Image.Image:
-    """Regenerate one reviewer-identified crop at high resolution and splice it back."""
+    """Regenerate a contextual crop and splice back only the eligible region."""
     source = source.convert("RGB")
     candidate = candidate.convert("RGB")
     source_gray = cv2.cvtColor(np.asarray(source), cv2.COLOR_RGB2GRAY)
@@ -1739,6 +2423,41 @@ def repair_region(
         round(bottom * candidate.height),
     )
     repaired = repaired.resize((dx2 - dx1, dy2 - dy1), Image.Resampling.LANCZOS)
+    # Image generation can reproduce the crop faithfully while shifting its whole
+    # lattice by a few pixels. Register the regenerated context back to the current
+    # page before selecting the tight splice, otherwise a correct reconstructed
+    # glyph can be clipped at the physical-defect boundary.
+    aligned_repair = align_candidate_to_source(
+        candidate.crop((dx1, dy1, dx2, dy2)),
+        repaired,
+    )
+    if aligned_repair is not None:
+        repaired = aligned_repair
     result = candidate.copy()
-    result.paste(repaired, (dx1, dy1))
+    if paste_region is None:
+        result.paste(repaired, (dx1, dy1))
+        return result
+
+    paste_left, paste_top, paste_right, paste_bottom = paste_region
+    paste_left = max(left, paste_left)
+    paste_top = max(top, paste_top)
+    paste_right = min(right, paste_right)
+    paste_bottom = min(bottom, paste_bottom)
+    if paste_right <= paste_left or paste_bottom <= paste_top:
+        return candidate
+    patch_x1 = round((paste_left - left) / (right - left) * repaired.width)
+    patch_y1 = round((paste_top - top) / (bottom - top) * repaired.height)
+    patch_x2 = round((paste_right - left) / (right - left) * repaired.width)
+    patch_y2 = round((paste_bottom - top) / (bottom - top) * repaired.height)
+    destination = (
+        round(paste_left * candidate.width),
+        round(paste_top * candidate.height),
+        round(paste_right * candidate.width),
+        round(paste_bottom * candidate.height),
+    )
+    patch = repaired.crop((patch_x1, patch_y1, patch_x2, patch_y2)).resize(
+        (destination[2] - destination[0], destination[3] - destination[1]),
+        Image.Resampling.LANCZOS,
+    )
+    result.paste(patch, destination[:2])
     return result

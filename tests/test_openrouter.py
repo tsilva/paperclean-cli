@@ -273,12 +273,12 @@ def test_cost_projection_uses_selected_endpoint_prices_and_credit_balances() -> 
         projection = client.cost_projection(document_total=1, page_total=1, max_attempts=3)
 
     assert projection.one_pass.generations == 1
-    assert projection.one_pass.reviews == 5
-    assert projection.one_pass.paid_calls == 6
-    assert projection.one_pass.cost_usd == Decimal("1.189452")
-    assert projection.configured_max.cost_usd == Decimal("3.568356")
-    assert projection.recovery_ceiling.paid_calls == 371
-    assert projection.recovery_ceiling.cost_usd == Decimal("64.616772")
+    assert projection.one_pass.reviews == 6
+    assert projection.one_pass.paid_calls == 7
+    assert projection.one_pass.cost_usd == Decimal("1.358412")
+    assert projection.configured_max.cost_usd == Decimal("3.737316")
+    assert projection.recovery_ceiling.paid_calls == 372
+    assert projection.recovery_ceiling.cost_usd == Decimal("64.785732")
     assert projection.account_remaining_usd == Decimal("0.718589992")
     assert projection.key_remaining_usd == Decimal("10")
 

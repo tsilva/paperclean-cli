@@ -5,6 +5,7 @@ import pytest
 from paperclean.prompting import (
     FEEDBACK_TEMPLATE,
     GENERATION_PROMPT,
+    ORIENTATION_PROMPT,
     PAGE_LOCATION_PROMPT,
     PHOTO_RECTIFICATION_PROMPT,
     PUNCH_HOLE_REPAIR_PROMPT,
@@ -17,6 +18,7 @@ from paperclean.prompting import (
 
 def test_all_primary_prompts_load_from_packaged_markdown() -> None:
     assert load_prompt("generation.md") == GENERATION_PROMPT
+    assert load_prompt("orientation.md") == ORIENTATION_PROMPT
     assert load_prompt("page-location.md") == PAGE_LOCATION_PROMPT
     assert load_prompt("photo-rectification.md") == PHOTO_RECTIFICATION_PROMPT
     assert load_prompt("punch-hole-repair.md") == PUNCH_HOLE_REPAIR_PROMPT
@@ -28,6 +30,16 @@ def test_all_primary_prompts_load_from_packaged_markdown() -> None:
 
 def test_review_prompt_requires_unambiguous_punch_hole_reconstruction() -> None:
     assert "punch hole overlaps authored ink" in REVIEW_PROMPT
+
+
+def test_orientation_prompt_defines_one_unambiguous_whole_page_rotation() -> None:
+    assert "counter-clockwise" in ORIENTATION_PROMPT
+    assert "0, 90, 180, or 270" in ORIENTATION_PROMPT
+    assert "Do not rotate an individual" in ORIENTATION_PROMPT
+
+
+def test_review_prompt_rejects_non_upright_reading_orientation() -> None:
+    assert "90,\n180, or 270 degree reading rotation" in REVIEW_PROMPT
     assert "merely plausible completion is not enough" in REVIEW_PROMPT
     assert "preserves the uncertain source evidence" in REVIEW_PROMPT
 

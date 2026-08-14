@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "paperclean"
+name = "paperclean-cli"
 version = "0.1.1"
 description = "Conservatively clean phone-scanned PDF and image documents with image generation and strict review."
 readme = "README.md"
@@ -33,9 +33,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/tsilva/paperclean"
-Repository = "https://github.com/tsilva/paperclean"
-Issues = "https://github.com/tsilva/paperclean/issues"
+Homepage = "https://github.com/tsilva/paperclean-cli"
+Repository = "https://github.com/tsilva/paperclean-cli"
+Issues = "https://github.com/tsilva/paperclean-cli/issues"
 
 [project.scripts]
 paperclean = "paperclean.cli:main"

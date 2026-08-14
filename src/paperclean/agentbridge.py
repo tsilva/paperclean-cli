@@ -22,9 +22,19 @@ from paperclean.errors import (
 )
 from paperclean.imaging import data_url, decode_bytes
 from paperclean.models import PageGeometry, ReviewVerdict, UsageRecord
-from paperclean.openrouter import PAGE_LOCATION_SCHEMA, REVIEW_SCHEMA, _parse_verdict
+from paperclean.openrouter import (
+    ORIENTATION_SCHEMA,
+    PAGE_LOCATION_SCHEMA,
+    REVIEW_SCHEMA,
+    _parse_verdict,
+)
 from paperclean.preflight import CostProjection, build_subscription_projection
-from paperclean.prompting import PAGE_LOCATION_PROMPT, REVIEW_PROMPT, REVIEW_SYSTEM_PROMPT
+from paperclean.prompting import (
+    ORIENTATION_PROMPT,
+    PAGE_LOCATION_PROMPT,
+    REVIEW_PROMPT,
+    REVIEW_SYSTEM_PROMPT,
+)
 
 MAX_IMAGE_RESPONSE_BYTES = 32 * 1024 * 1024
 
@@ -312,6 +322,52 @@ class AgentBridgeClient:
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ReviewerResponseError(
                 "AgentBridge returned invalid structured page geometry"
+            ) from exc
+
+    def reading_rotation(self, source: Image.Image) -> int:
+        response = self._request(
+            "POST",
+            "/chat/completions",
+            json_body={
+                "model": self.settings.review_model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Classify document reading orientation.",
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": ORIENTATION_PROMPT},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url(source, max_edge=2048)},
+                            },
+                        ],
+                    },
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": ORIENTATION_SCHEMA,
+                },
+                "reasoning_effort": "medium",
+                "max_tokens": 512,
+                "store": False,
+            },
+        )
+        usage_raw = response.get("usage")
+        self.costs.record(usage_raw if isinstance(usage_raw, dict) else None)
+        try:
+            content = response["choices"][0]["message"]["content"]
+            value = json.loads(content) if isinstance(content, str) else content
+            rotation = int(value["rotation_degrees"])
+            confidence = float(value["confidence"])
+            if rotation not in {0, 90, 180, 270} or not 0 <= confidence <= 1:
+                raise ValueError("invalid orientation")
+            return rotation if confidence >= 0.90 else 0
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReviewerResponseError(
+                "AgentBridge returned invalid structured reading orientation"
             ) from exc
 
     def review(

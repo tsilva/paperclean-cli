@@ -23,8 +23,11 @@ PaperClean requires Python 3.11 or newer. Keyenv is recommended on macOS:
 
 ```bash
 uv tool install keyenv-macos
-uv tool install paperclean
+uv tool install paperclean-cli
 ```
+
+The PyPI distribution is named `paperclean-cli`; it installs the `paperclean`
+command and Python package.
 
 Keyenv is the recommended way to keep `OPENROUTER_API_KEY` in the macOS
 Keychain. Create `~/.config/keyenv/.keyenv.toml`:
@@ -118,9 +121,9 @@ configuration, then repository-level configuration.
   five-view model verification. Rejected candidates retry with feedback, then fall
   back to a source-preserving white-paper cleanup that must pass the same verification.
   A page-scoped review timeout is retried exactly once before that attempt fails closed.
-  That recovery confirms every rejection once and records residual quality limitations
-  plus expected global deskew/layout rectification in legacy pages. Confirmed non-specific
-  alerts are recorded but do not veto a deterministic candidate. Explicit missing,
+  That recovery confirms every rejection once. Confirmed scanner-quality failures still
+  veto publication; only expected global deskew/layout rectification and conservatively
+  preserved source uncertainty are tolerated. Explicit missing,
   cropped, invented, text, table, and diagram discrepancies still fail closed; localized
   normalized source evidence is restored for text-like discrepancies and the candidate is
   reviewed again. The untouched original page is used only if recovery still fails.

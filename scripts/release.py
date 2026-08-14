@@ -17,6 +17,9 @@ PYPROJECT = ROOT / "pyproject.toml"
 CHANGELOG = ROOT / "CHANGELOG.md"
 HELPER = ROOT / ".codex/skills/build-release/scripts/release_build.py"
 VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+DISTRIBUTION = "paperclean-cli"
+ARTIFACT_STEM = "paperclean_cli"
+TAG_PREFIX = f"{DISTRIBUTION}-v"
 
 
 def run(args: list[str]) -> None:
@@ -38,7 +41,9 @@ def current_version() -> str:
 
 def pypi_unused(version: str) -> bool:
     try:
-        with urllib.request.urlopen(f"https://pypi.org/pypi/paperclean/{version}/json", timeout=20):
+        with urllib.request.urlopen(
+            f"https://pypi.org/pypi/{DISTRIBUTION}/{version}/json", timeout=20
+        ):
             return False
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -65,14 +70,14 @@ def patch_bump(version: str) -> str:
 def select_version(requested: str | None) -> str:
     current = current_version()
     version = requested or current
-    if requested is None and (tag_exists(f"paperclean-v{current}") or not pypi_unused(current)):
+    if requested is None and (tag_exists(f"{TAG_PREFIX}{current}") or not pypi_unused(current)):
         version = patch_bump(current)
     if VERSION_RE.fullmatch(version) is None:
         raise SystemExit("release version must be MAJOR.MINOR.PATCH")
     if not pypi_unused(version):
-        raise SystemExit(f"paperclean=={version} already exists on PyPI")
-    if tag_exists(f"paperclean-v{version}"):
-        raise SystemExit(f"tag paperclean-v{version} already exists")
+        raise SystemExit(f"{DISTRIBUTION}=={version} already exists on PyPI")
+    if tag_exists(f"{TAG_PREFIX}{version}"):
+        raise SystemExit(f"tag {TAG_PREFIX}{version} already exists")
     return version
 
 
@@ -148,7 +153,7 @@ def checks() -> None:
         raise SystemExit(f"expected one wheel and one sdist, found {distributions}")
     run(["uv", "run", "twine", "check", *distributions])
     run(["uv", "run", "python", str(HELPER), "audit-dist", "--dist-dir", "dist"])
-    wheel = next((ROOT / "dist").glob("paperclean-*-py3-none-any.whl"))
+    wheel = next((ROOT / "dist").glob(f"{ARTIFACT_STEM}-*-py3-none-any.whl"))
     run(
         [
             "uv",
@@ -176,10 +181,10 @@ def main() -> None:
     checks()
     run(["git", "add", "pyproject.toml", "uv.lock", "CHANGELOG.md"])
     if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=ROOT).returncode != 0:
-        run(["git", "commit", "-m", f"Release paperclean {version}"])
+        run(["git", "commit", "-m", f"Release {DISTRIBUTION} {version}"])
     else:
         print("release-metadata\talready committed")
-    tag = f"paperclean-v{version}"
+    tag = f"{TAG_PREFIX}{version}"
     run(["git", "tag", "-a", tag, "-m", f"PaperClean {version}"])
     run(["git", "push", "--atomic", remote, f"HEAD:{branch}", tag])
     print(f"released-tag\t{tag}")

@@ -18,6 +18,9 @@ distortion. Global de-skewing, perspective correction, scale-to-page, and clean 
 normalization are required and are not changed_layout. Never report removal of those
 defects as missing or changed content. Report changed_layout only when internal content
 relationships differ after geometric registration.
+Text and page furniture must also be upright for normal reading. A page left at a 90,
+180, or 270 degree reading rotation is not scanner-quality even when it matches the
+source orientation.
 
 When a punch hole overlaps authored ink, accept reconstructed underlying characters or
 rules only if their continuation is unambiguous from visible fragments, the same line or

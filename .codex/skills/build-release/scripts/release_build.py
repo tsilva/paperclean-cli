@@ -18,6 +18,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+DISTRIBUTION = "paperclean-cli"
+ARTIFACT_STEM = "paperclean_cli"
+TAG_PREFIX = f"{DISTRIBUTION}-v"
 
 
 def project_version() -> str:
@@ -31,26 +34,26 @@ def project_version() -> str:
 def check_pypi(version: str) -> None:
     try:
         with urllib.request.urlopen(
-            f"https://pypi.org/pypi/paperclean/{version}/json", timeout=20
+            f"https://pypi.org/pypi/{DISTRIBUTION}/{version}/json", timeout=20
         ) as response:
             data = json.load(response)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            print(f"unused\tpaperclean=={version}")
+            print(f"unused\t{DISTRIBUTION}=={version}")
             return
         raise
     files = data.get("urls", [])
     if files:
-        raise SystemExit(f"paperclean=={version} already exists on PyPI")
-    print(f"unused\tpaperclean=={version}")
+        raise SystemExit(f"{DISTRIBUTION}=={version} already exists on PyPI")
+    print(f"unused\t{DISTRIBUTION}=={version}")
 
 
 def wait_pypi(version: str, *, attempts: int = 60) -> None:
     expected = {
-        f"paperclean-{version}-py3-none-any.whl",
-        f"paperclean-{version}.tar.gz",
+        f"{ARTIFACT_STEM}-{version}-py3-none-any.whl",
+        f"{ARTIFACT_STEM}-{version}.tar.gz",
     }
-    url = f"https://pypi.org/pypi/paperclean/{version}/json"
+    url = f"https://pypi.org/pypi/{DISTRIBUTION}/{version}/json"
     for attempt in range(attempts):
         try:
             with urllib.request.urlopen(url, timeout=20) as response:
@@ -61,20 +64,20 @@ def wait_pypi(version: str, *, attempts: int = 60) -> None:
                 raise
             found = set()
         if expected <= found:
-            print(f"https://pypi.org/project/paperclean/{version}/")
+            print(f"https://pypi.org/project/{DISTRIBUTION}/{version}/")
             for filename in sorted(expected):
                 print(filename)
             return
-        print(f"waiting for paperclean {version} ({attempt + 1}/{attempts})", flush=True)
+        print(f"waiting for {DISTRIBUTION} {version} ({attempt + 1}/{attempts})", flush=True)
         time.sleep(20)
-    raise SystemExit(f"paperclean {version} did not appear on PyPI with both files")
+    raise SystemExit(f"{DISTRIBUTION} {version} did not appear on PyPI with both files")
 
 
 def _expected_files(directory: Path) -> tuple[Path, Path]:
     version = project_version()
-    wheel = directory / f"paperclean-{version}-py3-none-any.whl"
-    sdist = directory / f"paperclean-{version}.tar.gz"
-    actual = sorted(path.name for path in directory.glob("paperclean-*") if path.is_file())
+    wheel = directory / f"{ARTIFACT_STEM}-{version}-py3-none-any.whl"
+    sdist = directory / f"{ARTIFACT_STEM}-{version}.tar.gz"
+    actual = sorted(path.name for path in directory.glob(f"{ARTIFACT_STEM}-*") if path.is_file())
     expected = sorted([wheel.name, sdist.name])
     if actual != expected:
         raise SystemExit(f"expected exactly {expected}, found {actual}")
@@ -91,13 +94,15 @@ def audit_dist(directory: Path) -> None:
         if metadata_name is None:
             raise SystemExit("wheel has no METADATA")
         metadata = archive.read(metadata_name).decode("utf-8")
+        if f"Name: {DISTRIBUTION}\n" not in metadata:
+            raise SystemExit("wheel distribution name does not match pyproject")
         if f"Version: {project_version()}\n" not in metadata:
             raise SystemExit("wheel version does not match pyproject")
         if "paperclean = paperclean.cli:main" not in archive.read(
             metadata_name.replace("METADATA", "entry_points.txt")
         ).decode("utf-8"):
             raise SystemExit("wheel console entry point is missing")
-    prefix = f"paperclean-{project_version()}/"
+    prefix = f"{ARTIFACT_STEM}-{project_version()}/"
     with tarfile.open(sdist, "r:gz") as archive:
         members = archive.getmembers()
         if not members or any(not member.name.startswith(prefix) for member in members):
@@ -113,7 +118,7 @@ def audit_dist(directory: Path) -> None:
 
 
 def check_tag(tag: str) -> None:
-    expected = f"paperclean-v{project_version()}"
+    expected = f"{TAG_PREFIX}{project_version()}"
     if tag != expected:
         raise SystemExit(f"tag {tag!r} does not match project version; expected {expected!r}")
     print(f"valid\t{tag}")

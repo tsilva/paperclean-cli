@@ -17,20 +17,47 @@ from paperclean.restoration import (
     clear_page_border,
     detect_page_plane,
     dewarp_curved_page,
+    erase_contained_edge_artifacts,
+    erase_localized_pale_artifacts,
+    erase_residual_punch_hole_regions,
     has_preserved_photographic_regions,
     photographed_page_cleanup,
     rectify_page_geometry,
     rectify_photographed_page,
     rectify_source_to_reference,
+    regions_are_preserved_visual_panels,
     registered_review_pairs,
     remove_photo_capture_artifacts,
     repair_region,
     replace_with_source_evidence_regions,
     rescue_colored_marks,
+    residual_punch_hole_regions,
     restore_source_evidence_regions,
     restore_source_regions,
+    rotate_reading_orientation,
     source_preserving_cleanup,
 )
+
+
+def test_reading_rotation_preserves_canvas_and_orthogonal_pixels() -> None:
+    source = Image.new("RGB", (120, 80), "white")
+    source.putpixel((15, 20), (10, 20, 30))
+
+    rotated = rotate_reading_orientation(source, 180)
+
+    assert rotated.size == source.size
+    assert rotated.getpixel((104, 59)) == (10, 20, 30)
+
+
+def test_quarter_turn_reading_rotation_is_contained_without_cropping() -> None:
+    source = Image.new("RGB", (120, 80), "white")
+    ImageDraw.Draw(source).rectangle((0, 0, 119, 79), outline="black", width=2)
+
+    rotated = rotate_reading_orientation(source, 90)
+
+    assert rotated.size == source.size
+    assert rotated.getbbox() == (0, 0, 120, 80)
+    assert np.count_nonzero(np.asarray(rotated) < 128) > 0
 
 
 def test_dewarp_curved_page_straightens_content_following_bowed_surface() -> None:
@@ -464,8 +491,10 @@ def test_regional_prompt_requires_crisp_aligned_microprint() -> None:
 
 def test_punch_hole_prompt_requires_high_probability_reconstruction() -> None:
     assert "highly probable" in PUNCH_HOLE_REPAIR_PROMPT
-    assert "not unambiguous" in PUNCH_HOLE_REPAIR_PROMPT
-    assert "instead of guessing" in PUNCH_HOLE_REPAIR_PROMPT
+    assert "remove them completely in every case" in PUNCH_HOLE_REPAIR_PROMPT
+    assert "use clean white paper inside" in PUNCH_HOLE_REPAIR_PROMPT
+    assert "cannot be reconstructed with high probability" in PUNCH_HOLE_REPAIR_PROMPT
+    assert "rather than retaining the hole or guessing" in PUNCH_HOLE_REPAIR_PROMPT
 
 
 def test_clear_page_border_removes_outer_sliver_without_touching_content() -> None:
@@ -570,6 +599,16 @@ def test_distance_transform_finds_hole_merged_into_text_line() -> None:
     assert authored_punch_hole_regions(source)
 
 
+def test_short_glyph_extension_inside_hole_padding_requires_assisted_repair() -> None:
+    pixels = np.full((800, 600, 3), 238, dtype=np.uint8)
+    cv2.circle(pixels, (35, 300), 20, (0, 0, 0), thickness=-1)
+    cv2.rectangle(pixels, (52, 292), (62, 308), (0, 0, 0), thickness=-1)
+
+    candidates = _punch_hole_candidates(pixels)
+
+    assert any(touches_authored_ink for *_geometry, touches_authored_ink in candidates)
+
+
 def test_source_cleanup_removes_a_blank_punch_hole_near_ten_percent_margin() -> None:
     source = Image.new("RGB", (400, 600), (238, 225, 205))
     draw = ImageDraw.Draw(source)
@@ -590,6 +629,202 @@ def test_fragmented_antialiased_hole_rim_is_not_authored_ink() -> None:
 
     assert candidates
     assert all(touches_authored_ink is False for *_geometry, touches_authored_ink in candidates)
+
+
+def test_source_cleanup_preserves_ink_inside_hole_halo_padding() -> None:
+    pixels = np.full((800, 600, 3), 238, dtype=np.uint8)
+    cv2.circle(pixels, (35, 300), 20, (0, 0, 0), thickness=-1)
+    cv2.line(pixels, (62, 250), (62, 350), (0, 0, 0), thickness=3)
+
+    candidates = _punch_hole_candidates(pixels)
+    assert candidates
+    assert all(touches_authored_ink is False for *_geometry, touches_authored_ink in candidates)
+
+    cleaned = np.asarray(source_preserving_cleanup(Image.fromarray(pixels, "RGB")))
+
+    assert np.all(cleaned[300, 35] == 255)
+    assert np.all(cleaned[300, 62] < 80)
+
+
+def test_two_aligned_annular_punches_are_removed_but_single_ring_is_preserved() -> None:
+    pixels = np.full((1000, 800, 3), 238, dtype=np.uint8)
+    for center_y in (350, 650):
+        cv2.circle(pixels, (45, center_y), 24, (0, 0, 0), thickness=7)
+
+    candidates = _punch_hole_candidates(pixels)
+
+    assert len(candidates) >= 2
+    cleaned = np.asarray(source_preserving_cleanup(Image.fromarray(pixels, "RGB")))
+    assert np.all(cleaned[350, 45] == 255)
+    assert np.all(cleaned[650, 45] == 255)
+
+
+def test_high_resolution_punch_detection_maps_working_geometry_back() -> None:
+    pixels = np.full((3200, 2400, 3), 238, dtype=np.uint8)
+    cv2.circle(pixels, (125, 1200), 55, (0, 0, 0), thickness=-1)
+
+    candidates = _punch_hole_candidates(pixels)
+
+    assert any(
+        abs(center_x - 125) <= 5
+        and abs(center_y - 1200) <= 5
+        and 45 <= radius <= 65
+        and not touches_authored_ink
+        for center_x, center_y, radius, _padding, touches_authored_ink in candidates
+    )
+
+
+def test_hough_punch_search_is_confined_to_side_strips(monkeypatch) -> None:
+    pixels = np.full((1000, 800, 3), 238, dtype=np.uint8)
+    searched_shapes: list[tuple[int, int]] = []
+
+    def hough(image, *_args, **_kwargs):
+        searched_shapes.append(image.shape)
+        return None
+
+    monkeypatch.setattr(cv2, "HoughCircles", hough)
+
+    _punch_hole_candidates(pixels)
+
+    assert len(searched_shapes) == 2
+    assert all(height == 1000 for height, _width in searched_shapes)
+    assert all(width <= round(pixels.shape[1] * 0.12) for _height, width in searched_shapes)
+
+
+def test_residual_punch_gate_matches_only_source_aligned_holes() -> None:
+    source_pixels = np.full((800, 600, 3), 238, dtype=np.uint8)
+    cv2.circle(source_pixels, (35, 300), 20, (0, 0, 0), thickness=-1)
+    cv2.rectangle(source_pixels, (52, 292), (180, 308), (0, 0, 0), thickness=-1)
+    source = Image.fromarray(source_pixels, "RGB")
+
+    retained = source.copy()
+    repaired_pixels = source_pixels.copy()
+    cv2.circle(repaired_pixels, (35, 300), 30, (255, 255, 255), thickness=-1)
+    cv2.rectangle(repaired_pixels, (20, 292), (180, 308), (0, 0, 0), thickness=-1)
+    repaired = Image.fromarray(repaired_pixels, "RGB")
+    unrelated_pixels = repaired_pixels.copy()
+    cv2.circle(unrelated_pixels, (35, 500), 20, (0, 0, 0), thickness=-1)
+    unrelated = Image.fromarray(unrelated_pixels, "RGB")
+
+    assert residual_punch_hole_regions(source, retained)
+    assert residual_punch_hole_regions(source, repaired) == []
+    assert residual_punch_hole_regions(source, unrelated) == []
+
+
+def test_residual_punch_gate_finds_a_shifted_generated_semicircle() -> None:
+    source_pixels = np.full((800, 600, 3), 238, dtype=np.uint8)
+    cv2.circle(source_pixels, (35, 300), 20, (0, 0, 0), thickness=-1)
+    cv2.rectangle(source_pixels, (52, 292), (180, 308), (0, 0, 0), thickness=-1)
+    source = Image.fromarray(source_pixels, "RGB")
+
+    candidate_pixels = np.full((800, 600, 3), 255, dtype=np.uint8)
+    cv2.rectangle(candidate_pixels, (20, 292), (180, 308), (0, 0, 0), thickness=-1)
+    cv2.circle(candidate_pixels, (35, 330), 20, (0, 0, 0), thickness=-1)
+    cv2.rectangle(candidate_pixels, (0, 305), (70, 329), (255, 255, 255), thickness=-1)
+    candidate = Image.fromarray(candidate_pixels, "RGB")
+
+    regions = residual_punch_hole_regions(source, candidate)
+
+    assert len(regions) == 1
+    _left, top, _right, bottom = regions[0]
+    assert (top + bottom) / 2 > 0.40
+
+
+def test_residual_punch_erase_preserves_adjacent_restored_text() -> None:
+    source_pixels = np.full((800, 600, 3), 238, dtype=np.uint8)
+    cv2.circle(source_pixels, (35, 300), 20, (0, 0, 0), thickness=-1)
+    cv2.rectangle(source_pixels, (52, 292), (180, 308), (0, 0, 0), thickness=-1)
+    source = Image.fromarray(source_pixels, "RGB")
+
+    candidate_pixels = np.full((800, 600, 3), 255, dtype=np.uint8)
+    cv2.rectangle(candidate_pixels, (20, 292), (180, 308), (0, 0, 0), thickness=-1)
+    cv2.circle(candidate_pixels, (35, 330), 20, (0, 0, 0), thickness=-1)
+    cv2.rectangle(candidate_pixels, (0, 305), (70, 329), (255, 255, 255), thickness=-1)
+    candidate = Image.fromarray(candidate_pixels, "RGB")
+    regions = residual_punch_hole_regions(source, candidate)
+
+    fixed = erase_residual_punch_hole_regions(candidate, regions)
+
+    assert residual_punch_hole_regions(source, fixed) == []
+    assert fixed.getpixel((80, 300)) == (0, 0, 0)
+
+
+def test_edge_artifact_erase_preserves_components_crossing_review_region() -> None:
+    pixels = np.full((600, 400, 3), 255, dtype=np.uint8)
+    cv2.rectangle(pixels, (60, 2), (66, 7), (170, 170, 170), thickness=-1)
+    cv2.rectangle(pixels, (75, 8), (95, 18), (0, 0, 0), thickness=-1)
+    candidate = Image.fromarray(pixels, "RGB")
+
+    fixed = erase_contained_edge_artifacts(candidate, (0.10, 0.0, 0.25, 0.02))
+
+    assert fixed.getpixel((63, 4)) == (255, 255, 255)
+    assert fixed.getpixel((85, 12)) == (0, 0, 0)
+
+
+def test_edge_artifact_erase_ignores_nonedge_and_broad_regions() -> None:
+    candidate = Image.new("RGB", (400, 600), "white")
+    candidate.putpixel((200, 300), (100, 100, 100))
+
+    nonedge = erase_contained_edge_artifacts(candidate, (0.45, 0.45, 0.55, 0.55))
+    broad = erase_contained_edge_artifacts(candidate, (0.0, 0.0, 1.0, 0.25))
+
+    assert np.array_equal(np.asarray(nonedge), np.asarray(candidate))
+    assert np.array_equal(np.asarray(broad), np.asarray(candidate))
+
+
+def test_edge_artifact_erase_ignores_wide_strip_that_only_touches_side() -> None:
+    candidate = Image.new("RGB", (400, 600), "white")
+    candidate.putpixel((20, 270), (170, 170, 170))
+
+    fixed = erase_contained_edge_artifacts(candidate, (0.0, 0.40, 0.35, 0.50))
+
+    assert np.array_equal(np.asarray(fixed), np.asarray(candidate))
+
+
+def test_edge_artifact_erase_ignores_narrow_region_near_but_not_on_side() -> None:
+    candidate = Image.new("RGB", (400, 600), "white")
+    candidate.putpixel((20, 270), (170, 170, 170))
+
+    fixed = erase_contained_edge_artifacts(candidate, (0.02, 0.40, 0.07, 0.50))
+
+    assert np.array_equal(np.asarray(fixed), np.asarray(candidate))
+
+
+def test_localized_pale_artifact_erase_preserves_dark_crossing_ink() -> None:
+    pixels = np.full((600, 400, 3), 255, dtype=np.uint8)
+    cv2.line(pixels, (20, 300), (380, 300), (190, 190, 190), thickness=3)
+    cv2.rectangle(pixels, (198, 285), (202, 315), (0, 0, 0), thickness=-1)
+    candidate = Image.fromarray(pixels, "RGB")
+
+    fixed = erase_localized_pale_artifacts(candidate, (0.02, 0.45, 0.98, 0.55))
+
+    assert fixed.getpixel((100, 300)) == (255, 255, 255)
+    assert fixed.getpixel((200, 300)) == (0, 0, 0)
+
+
+def test_localized_pale_artifact_erase_preserves_dark_rules_and_broad_regions() -> None:
+    pixels = np.full((600, 400, 3), 255, dtype=np.uint8)
+    cv2.line(pixels, (20, 300), (380, 300), (0, 0, 0), thickness=2)
+    candidate = Image.fromarray(pixels, "RGB")
+
+    thin = erase_localized_pale_artifacts(candidate, (0.02, 0.45, 0.98, 0.55))
+    broad = erase_localized_pale_artifacts(candidate, (0.0, 0.2, 1.0, 0.8))
+
+    assert np.array_equal(np.asarray(thin), np.asarray(candidate))
+    assert np.array_equal(np.asarray(broad), np.asarray(candidate))
+
+
+def test_high_resolution_residual_punch_gate_uses_mapped_geometry() -> None:
+    source_pixels = np.full((3200, 2400, 3), 238, dtype=np.uint8)
+    cv2.circle(source_pixels, (125, 1200), 55, (0, 0, 0), thickness=-1)
+    source = Image.fromarray(source_pixels, "RGB")
+    retained = source.copy()
+    repaired_pixels = source_pixels.copy()
+    cv2.circle(repaired_pixels, (125, 1200), 85, (255, 255, 255), thickness=-1)
+    repaired = Image.fromarray(repaired_pixels, "RGB")
+
+    assert residual_punch_hole_regions(source, retained)
+    assert residual_punch_hole_regions(source, repaired) == []
 
 
 def test_source_cleanup_removes_punch_hole_halo() -> None:
@@ -670,6 +905,8 @@ def test_source_cleanup_keeps_large_shaded_form_panel_exact() -> None:
     cleaned = np.asarray(source_preserving_cleanup(source))
 
     assert np.array_equal(cleaned[y1:y2, x1:x2], pixels[y1:y2, x1:x2])
+    assert np.all(cleaned[y1:y2, x1 - 4 : x1] == 255)
+    assert np.all(cleaned[y1:y2, x2 : x2 + 4] == 255)
 
 
 def test_source_cleanup_keeps_complete_gradient_shaded_form_column() -> None:
@@ -697,12 +934,41 @@ def test_source_cleanup_keeps_complete_gradient_shaded_form_column() -> None:
     assert np.array_equal(cleaned[y1:y2, x1:x2], pixels[y1:y2, x1:x2])
 
 
+def test_only_regions_inside_preserved_visual_panels_are_adjudicable() -> None:
+    pixels = np.full((1000, 800, 3), 238, dtype=np.uint8)
+    pixels[200:800, 560:740] = 190
+    source = Image.fromarray(pixels, "RGB")
+    candidate = source.copy()
+
+    assert regions_are_preserved_visual_panels(
+        source,
+        candidate,
+        [(0.72, 0.25, 0.90, 0.75)],
+    )
+    assert not regions_are_preserved_visual_panels(
+        source,
+        candidate,
+        [(0.10, 0.25, 0.30, 0.75)],
+    )
+    assert not regions_are_preserved_visual_panels(source, candidate, [])
+
+
+def test_high_resolution_panel_adjudication_uses_normalized_regions() -> None:
+    pixels = np.full((3200, 2400, 3), 238, dtype=np.uint8)
+    pixels[640:2560, 1680:2220] = 190
+    source = Image.fromarray(pixels, "RGB")
+
+    assert regions_are_preserved_visual_panels(
+        source,
+        source.copy(),
+        [(0.72, 0.25, 0.90, 0.75)],
+    )
+
+
 def test_source_cleanup_does_not_preserve_low_detail_edge_shadow() -> None:
     pixels = np.full((1000, 800, 3), (235, 225, 205), dtype=np.uint8)
     yy, xx = np.mgrid[820:1000, 120:760]
-    shadow = np.clip(200 + (xx - 120) * 8 / 640 + (yy - 820) * 4 / 180, 0, 255).astype(
-        np.uint8
-    )
+    shadow = np.clip(200 + (xx - 120) * 8 / 640 + (yy - 820) * 4 / 180, 0, 255).astype(np.uint8)
     pixels[820:1000, 120:760] = np.stack((shadow, shadow, shadow), axis=2)
 
     cleaned = np.asarray(source_preserving_cleanup(Image.fromarray(pixels, "RGB")))
@@ -834,3 +1100,71 @@ def test_regional_repair_splices_generated_crop(monkeypatch) -> None:
     assert client.calls == 1
     assert result.getbbox() == candidate.getbbox()
     assert result.getpixel((100, 140)) != (255, 255, 255)
+
+
+def test_regional_repair_uses_wide_context_but_splices_only_damage(monkeypatch) -> None:
+    source = Image.new("RGB", (200, 300), "white")
+    candidate = Image.new("RGB", source.size, "white")
+    ImageDraw.Draw(candidate).rectangle((70, 120, 130, 160), fill="blue")
+    monkeypatch.setattr(
+        "paperclean.restoration._registration_matrix",
+        lambda *_args: np.eye(3),
+    )
+
+    class Generator:
+        def generate(self, crop: Image.Image, _prompt: str, *, max_edge: int) -> Image.Image:
+            assert crop.width > 20
+            assert max_edge == 4096
+            return Image.new("RGB", crop.size, "black")
+
+    result = repair_region(
+        source,
+        candidate,
+        (0.25, 0.30, 0.75, 0.70),
+        client=Generator(),
+        max_edge=4096,
+        paste_region=(0.45, 0.45, 0.55, 0.55),
+    )
+
+    assert result.getpixel((100, 150)) == (0, 0, 0)
+    assert result.getpixel((75, 130)) == (0, 0, 255)
+    assert result.getpixel((50, 100)) == (255, 255, 255)
+
+
+def test_regional_repair_registers_generated_context_before_tight_splice(monkeypatch) -> None:
+    source = Image.new("RGB", (200, 300), "white")
+    candidate = Image.new("RGB", source.size, "white")
+    ImageDraw.Draw(candidate).rectangle((95, 130, 115, 150), fill="black")
+    matrices = iter(
+        (
+            np.eye(3),
+            np.array(
+                [[1.0, 0.0, -0.05], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        "paperclean.restoration._registration_matrix",
+        lambda *_args: next(matrices),
+    )
+
+    class Generator:
+        def generate(self, crop: Image.Image, _prompt: str, *, max_edge: int) -> Image.Image:
+            generated = Image.new("RGB", crop.size, "white")
+            ImageDraw.Draw(generated).rectangle((35, 50, 55, 70), fill="blue")
+            return generated
+
+    result = repair_region(
+        source,
+        candidate,
+        (0.3, 0.3, 0.7, 0.7),
+        client=Generator(),
+        max_edge=4096,
+        paste_region=(0.45, 0.42, 0.55, 0.52),
+    )
+
+    # The generated blue mark starts five percent too far right in crop-relative
+    # coordinates. Local registration shifts it onto the tight destination instead
+    # of letting the splice clip the repaired mark.
+    assert result.getpixel((95, 135))[2] > 128

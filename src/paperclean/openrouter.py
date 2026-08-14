@@ -34,7 +34,12 @@ from paperclean.preflight import (
     build_cost_projection,
     parse_unit_prices,
 )
-from paperclean.prompting import PAGE_LOCATION_PROMPT, REVIEW_PROMPT, REVIEW_SYSTEM_PROMPT
+from paperclean.prompting import (
+    ORIENTATION_PROMPT,
+    PAGE_LOCATION_PROMPT,
+    REVIEW_PROMPT,
+    REVIEW_SYSTEM_PROMPT,
+)
 
 ALLOWED_CATEGORIES = (
     "changed_text",
@@ -189,6 +194,20 @@ PAGE_LOCATION_SCHEMA: dict[str, Any] = {
     },
 }
 
+ORIENTATION_SCHEMA: dict[str, Any] = {
+    "name": "paperclean_reading_orientation",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["rotation_degrees", "confidence"],
+        "properties": {
+            "rotation_degrees": {"type": "integer", "enum": [0, 90, 180, 270]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+    },
+}
+
 
 @dataclass(frozen=True, slots=True)
 class Endpoint:
@@ -282,7 +301,7 @@ class OpenRouterClient:
             headers={
                 "Authorization": f"Bearer {settings.api_key}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/tsilva/paperclean",
+                "HTTP-Referer": "https://github.com/tsilva/paperclean-cli",
                 "X-Title": "PaperClean",
             },
             timeout=httpx.Timeout(180.0, connect=20.0),
@@ -625,6 +644,50 @@ class OpenRouterClient:
             raise
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ReviewerResponseError("the reviewer returned invalid structured output") from exc
+
+    def reading_rotation(self, source: Image.Image) -> int:
+        endpoint = self._required_endpoint(self.review_endpoint, "preflight review endpoint")
+        body: dict[str, Any] = {
+            "model": endpoint.model,
+            "messages": [
+                {"role": "system", "content": "Classify document reading orientation."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ORIENTATION_PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url(source, max_edge=2048)},
+                        },
+                    ],
+                },
+            ],
+            "response_format": {"type": "json_schema", "json_schema": ORIENTATION_SCHEMA},
+            "provider": {"only": [endpoint.provider_slug], "require_parameters": True},
+        }
+        if "reasoning_effort" in endpoint.supported_parameters:
+            body["reasoning_effort"] = "medium"
+        body[
+            "max_completion_tokens"
+            if "max_completion_tokens" in endpoint.supported_parameters
+            else "max_tokens"
+        ] = 512
+        response = self._request("POST", "/chat/completions", json_body=body, paid=True)
+        self.costs.record(
+            response.get("usage") if isinstance(response.get("usage"), dict) else None
+        )
+        try:
+            content = response["choices"][0]["message"]["content"]
+            value = json.loads(content) if isinstance(content, str) else content
+            rotation = int(value["rotation_degrees"])
+            confidence = float(value["confidence"])
+            if rotation not in {0, 90, 180, 270} or not math.isfinite(confidence):
+                raise ValueError("invalid orientation")
+            return rotation if confidence >= 0.90 else 0
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReviewerResponseError(
+                "the orientation classifier returned invalid output"
+            ) from exc
 
     def locate_page(self, source: Image.Image) -> PageGeometry | None:
         endpoint = self._required_endpoint(self.review_endpoint, "preflight review endpoint")

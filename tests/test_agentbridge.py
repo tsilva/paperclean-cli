@@ -114,7 +114,7 @@ def test_agentbridge_client_runs_preflight_generation_and_structured_review() ->
     assert projection.backend_version == "0.1.9"
     assert projection.one_pass.cost_usd is None
     assert projection.one_pass.generations == 2
-    assert projection.one_pass.reviews == 10
+    assert projection.one_pass.reviews == 12
     assert calls[0][0] == "/api/v1/images"
     assert calls[0][1]["store"] is False
     assert calls[0][1]["n"] == 1
