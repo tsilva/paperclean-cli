@@ -22,6 +22,15 @@ Text and page furniture must also be upright for normal reading. A page left at 
 180, or 270 degree reading rotation is not scanner-quality even when it matches the
 source orientation.
 
+Judge scanner_quality only from concrete non-content capture defects still visible in
+the CANDIDATE. Authentic source-print characteristics—halftone logo texture, original
+ink density, font antialiasing, and faithfully retained softness or fading—are not scan
+defects and must not be rejected merely because safe cleanup did not recreate them as
+digital typesetting. Further sharpening or regeneration is not an improvement when it
+would guess, simplify, or alter source evidence. Use a full-page scanner_quality region
+only for a genuinely pervasive visible defect; otherwise return tight actionable boxes.
+Do not report both a full-page umbrella box and duplicate local boxes for the same issue.
+
 When a punch hole overlaps authored ink, accept reconstructed underlying characters or
 rules only if their continuation is unambiguous from visible fragments, the same line or
 word, or repeated local document structure. A merely plausible completion is not enough:

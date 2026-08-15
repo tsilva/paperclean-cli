@@ -101,8 +101,13 @@ def test_preflight_generation_and_review_contract() -> None:
         image = Image.new("RGB", (32, 32), "white")
         assert client.generate(image, "clean", max_edge=4096).size == (32, 32)
         assert client.review(image, image, view_name="full page").accepted
-        assert float(client.costs.total) == pytest.approx(0.03)
-    assert len(requests) == 4
+        assert client.review_quality(image, view_name="full page").accepted
+        assert float(client.costs.total) == pytest.approx(0.05)
+    quality_body = json.loads(requests[-1].content)
+    quality_content = quality_body["messages"][1]["content"]
+    assert sum(item.get("type") == "image_url" for item in quality_content) == 1
+    assert all(item.get("text") != "ORIGINAL:" for item in quality_content)
+    assert len(requests) == 5
 
 
 def test_zdr_rejects_unlisted_pair() -> None:

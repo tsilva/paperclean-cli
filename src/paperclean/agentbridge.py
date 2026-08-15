@@ -30,6 +30,7 @@ from paperclean.openrouter import (
 )
 from paperclean.preflight import CostProjection, build_subscription_projection
 from paperclean.prompting import (
+    CANDIDATE_QUALITY_PROMPT,
     ORIENTATION_PROMPT,
     PAGE_LOCATION_PROMPT,
     REVIEW_PROMPT,
@@ -419,3 +420,51 @@ class AgentBridgeClient:
             raise ReviewerResponseError(
                 "AgentBridge returned invalid structured review output"
             ) from exc
+
+    def review_quality(self, candidate: Image.Image, *, view_name: str) -> ReviewVerdict:
+        prompt = CANDIDATE_QUALITY_PROMPT.replace("{view_name}", view_name)
+        response = self._request(
+            "POST",
+            "/chat/completions",
+            json_body={
+                "model": self.settings.review_model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": REVIEW_SYSTEM_PROMPT,
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "text", "text": "CANDIDATE:"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url(candidate, max_edge=2048)},
+                            },
+                        ],
+                    },
+                ],
+                "response_format": {"type": "json_schema", "json_schema": REVIEW_SCHEMA},
+                "reasoning_effort": "medium",
+                "max_tokens": 2048,
+                "store": False,
+            },
+        )
+        usage_raw = response.get("usage")
+        usage = self.costs.record(usage_raw if isinstance(usage_raw, dict) else None)
+        try:
+            content = response["choices"][0]["message"]["content"]
+            value = json.loads(content) if isinstance(content, str) else content
+            verdict = _parse_verdict(value, usage)
+        except ReviewerResponseError:
+            raise
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReviewerResponseError(
+                "AgentBridge returned invalid structured quality review output"
+            ) from exc
+        if not verdict.content_match or any(
+            item.category != "scanner_quality" for item in verdict.discrepancies
+        ):
+            raise ReviewerResponseError("AgentBridge quality review violated its contract")
+        return verdict

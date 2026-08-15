@@ -50,3 +50,10 @@ class ModelClient(Protocol):
         *,
         view_name: str,
     ) -> ReviewVerdict: ...
+
+    def review_quality(
+        self,
+        candidate: Image.Image,
+        *,
+        view_name: str,
+    ) -> ReviewVerdict: ...

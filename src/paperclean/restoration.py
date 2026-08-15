@@ -162,9 +162,10 @@ def _robust_boundary_curve(
     *,
     extent: int,
     degree: int,
+    minimum_coverage: float = 0.45,
 ) -> np.ndarray | None:
     """Fit a smooth page boundary while rejecting fingers and concave notches."""
-    if len(positions) < max(32, round(extent * 0.45)):
+    if len(positions) < max(32, round(extent * minimum_coverage)):
         return None
     center = (extent - 1) / 2
     scale = max(1.0, center)
@@ -651,35 +652,243 @@ def _remove_paper_tone(pixels: np.ndarray) -> np.ndarray:
     return result
 
 
+def _authored_chromatic_mask(pixels: np.ndarray) -> np.ndarray:
+    """Locate colored authored ink independently of the surrounding paper cast."""
+
+    height, width = pixels.shape[:2]
+    source = pixels.astype(np.float32)
+    sigma = max(height, width) / 45
+    background = cv2.GaussianBlur(source, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    normalized = np.clip(source * 246 / np.maximum(background, 36), 0, 255).astype(np.uint8)
+    gray = cv2.cvtColor(normalized, cv2.COLOR_RGB2GRAY)
+    chroma = normalized.max(axis=2).astype(np.int16) - normalized.min(axis=2).astype(np.int16)
+    # Only the light/mid-tone chroma that paper whitening could erase needs this
+    # protection. Dark signatures, stamps, and text already survive the ordinary
+    # ink threshold. Requiring a strong locally white-balanced seed prevents beige
+    # foxing, punch halos, and chromatic fringes around black glyphs from being
+    # pasted back onto the clean page.
+    seeds = ((chroma >= 24) & (gray >= 165) & (gray < 252)).astype(np.uint8)
+    support = ((chroma >= 10) & (gray >= 155) & (gray < 254)).astype(np.uint8)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        support,
+        connectivity=8,
+    )
+    if count <= 1:
+        return np.zeros((height, width), dtype=np.uint8)
+    seed_counts = np.bincount(labels.ravel(), weights=seeds.ravel(), minlength=count)
+    short_edge = min(height, width)
+    minimum_area = max(12, round(short_edge * short_edge * 0.000003))
+    retained = (stats[:, cv2.CC_STAT_AREA] >= minimum_area) & (seed_counts >= 8)
+    retained[0] = False
+    mask = retained[labels].astype(np.uint8) * 255
+    expansion = max(1, round(short_edge * 0.0007))
+    return np.asarray(
+        cv2.dilate(mask, np.ones((expansion * 2 + 1, expansion * 2 + 1), np.uint8)),
+        dtype=np.uint8,
+    )
+
+
+def _remove_isolated_scan_specks(
+    cleaned: np.ndarray,
+    source: np.ndarray,
+) -> np.ndarray:
+    """Remove tiny isolated neutral scanner noise while preserving uncertain ink.
+
+    Contrast normalization can turn a pale one-pixel paper fleck into a dark dot.
+    Delete only components that were pale and neutral in the source, remain tiny at
+    the current resolution, and are isolated from a dilated support around larger
+    authored strokes. Dark source marks, colored marks, punctuation, diacritics,
+    and nearby microprint therefore remain untouched.
+    """
+
+    result = cleaned.copy()
+    gray = cv2.cvtColor(result, cv2.COLOR_RGB2GRAY)
+    foreground = (gray < 225).astype(np.uint8)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        foreground,
+        connectivity=8,
+    )
+    if count <= 1:
+        return result
+    short_edge = min(result.shape[:2])
+    maximum_extent = max(4, round(short_edge * 0.004))
+    maximum_area = max(16, round(short_edge * short_edge * 0.0000125))
+    small_components = (
+        (stats[:, cv2.CC_STAT_AREA] <= maximum_area)
+        & (stats[:, cv2.CC_STAT_WIDTH] <= maximum_extent)
+        & (stats[:, cv2.CC_STAT_HEIGHT] <= maximum_extent)
+    )
+    small_components[0] = False
+    core_components = ~small_components
+    core_components[0] = False
+    authored_core = core_components[labels].astype(np.uint8)
+    support_radius = max(3, round(short_edge * 0.006))
+    authored_support = cv2.dilate(
+        authored_core,
+        np.ones((support_radius * 2 + 1, support_radius * 2 + 1), np.uint8),
+    )
+    source_gray = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY)
+    source_chroma = source.max(axis=2).astype(np.int16) - source.min(axis=2).astype(np.int16)
+    flattened_labels = labels.astype(np.intp, copy=False).ravel()
+    maximum_source_chroma = np.zeros(count, dtype=np.int16)
+    np.maximum.at(maximum_source_chroma, flattened_labels, source_chroma.ravel())
+    minimum_source_gray = np.full(count, 255, dtype=np.uint8)
+    np.minimum.at(minimum_source_gray, flattened_labels, source_gray.ravel())
+    touches_authored_support = np.zeros(count, dtype=np.uint8)
+    np.maximum.at(touches_authored_support, flattened_labels, authored_support.ravel())
+    neighborhood_ink = cv2.boxFilter(
+        foreground,
+        ddepth=cv2.CV_32S,
+        ksize=(support_radius * 2 + 1, support_radius * 2 + 1),
+        normalize=False,
+    )
+    maximum_neighborhood_ink = np.zeros(count, dtype=np.int32)
+    np.maximum.at(maximum_neighborhood_ink, flattened_labels, neighborhood_ink.ravel())
+    centroid_x = np.clip(np.rint(centroids[:, 0]).astype(np.intp), 0, result.shape[1] - 1)
+    centroid_y = np.clip(np.rint(centroids[:, 1]).astype(np.intp), 0, result.shape[0] - 1)
+    centroid_seeds = np.zeros_like(foreground)
+    centroid_seeds[centroid_y[1:], centroid_x[1:]] = 1
+    neighboring_components = cv2.boxFilter(
+        centroid_seeds,
+        ddepth=cv2.CV_32S,
+        ksize=(support_radius * 2 + 1, support_radius * 2 + 1),
+        normalize=False,
+    )[centroid_y, centroid_x]
+    minimum_cluster_ink = max(12, round(short_edge * 0.02))
+    removable = (
+        small_components
+        & (touches_authored_support == 0)
+        & (maximum_source_chroma < 35)
+        & (minimum_source_gray >= 170)
+        & (maximum_neighborhood_ink < minimum_cluster_ink)
+        & (neighboring_components < 2)
+    )
+    removable[0] = False
+    result[removable[labels]] = 255
+    return result
+
+
+def _boundary_scanner_rail_mask(pixels: np.ndarray) -> np.ndarray:
+    """Find narrow dark runs that enter from a physical scan boundary."""
+
+    height, width = pixels.shape[:2]
+    gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
+    dark_boundary = 170
+    light_paper = 200
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    def leading_run(values: np.ndarray, maximum_depth: int) -> int:
+        seed_depth = max(2, round(maximum_depth * 0.25))
+        dark_starts = np.flatnonzero(values[:seed_depth] < dark_boundary)
+        if dark_starts.size == 0:
+            return 0
+        start = int(dark_starts[0])
+        light_run = max(3, round(maximum_depth * 0.04))
+        light = (values[start:maximum_depth] >= light_paper).astype(np.uint8)
+        if light.size < light_run:
+            return 0
+        consecutive = np.convolve(light, np.ones(light_run, dtype=np.uint8), mode="valid")
+        transitions = np.flatnonzero(consecutive == light_run)
+        if transitions.size == 0:
+            # A dark image that genuinely runs to the page edge has no paper
+            # transition inside the narrow search band and is not a scanner rail.
+            return 0
+        return start + int(transitions[0])
+
+    maximum_x = max(4, round(width * 0.08))
+    maximum_y = max(4, round(height * 0.06))
+    vertical = np.zeros_like(mask)
+    horizontal = np.zeros_like(mask)
+
+    def inferred_runs(lines: np.ndarray, maximum_depth: int) -> np.ndarray:
+        exact = np.asarray([leading_run(line, maximum_depth) for line in lines], dtype=np.float32)
+        positions = np.flatnonzero(exact > 0)
+        if positions.size == 0:
+            return exact.astype(np.int32)
+        supports_deep_wedge = (
+            positions.size >= 32
+            and float(np.ptp(positions)) >= len(lines) * 0.60
+            and float(np.median(exact[positions])) >= maximum_depth * 0.40
+        )
+        curve = _robust_boundary_curve(
+            positions.astype(np.float64),
+            exact[positions].astype(np.float64),
+            extent=len(lines),
+            degree=3,
+            minimum_coverage=0.03 if supports_deep_wedge else 0.45,
+        )
+        if curve is None:
+            return exact.astype(np.int32)
+        seed_depth = max(2, round(maximum_depth * 0.25))
+        has_boundary_darkness = np.any(lines[:, :seed_depth] < dark_boundary, axis=1)
+        inferred = np.asarray(
+            np.clip(np.rint(curve), 0, maximum_depth),
+            dtype=np.int32,
+        )
+        inferred[~has_boundary_darkness] = 0
+        return inferred
+
+    left_runs = inferred_runs(gray, maximum_x)
+    right_runs = inferred_runs(gray[:, ::-1], maximum_x)
+    for y, (left, right) in enumerate(zip(left_runs, right_runs, strict=True)):
+        if left:
+            vertical[y, :left] = 255
+        if right:
+            vertical[y, width - right :] = 255
+    top_runs = inferred_runs(gray.T, maximum_y)
+    bottom_runs = inferred_runs(gray[::-1, :].T, maximum_y)
+    for x, (top, bottom) in enumerate(zip(top_runs, bottom_runs, strict=True)):
+        if top:
+            horizontal[:top, x] = 255
+        if bottom:
+            horizontal[height - bottom :, x] = 255
+
+    def retain_long_components(
+        candidates: np.ndarray,
+        *,
+        vertical_axis: bool,
+    ) -> np.ndarray:
+        retained = np.zeros_like(candidates)
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            candidates,
+            connectivity=8,
+        )
+        for label in range(1, count):
+            component_width = stats[label, cv2.CC_STAT_WIDTH]
+            component_height = stats[label, cv2.CC_STAT_HEIGHT]
+            if vertical_axis:
+                long_enough = component_height >= height * 0.04
+                narrow_enough = component_width <= width * 0.08
+            else:
+                long_enough = component_width >= width * 0.04
+                narrow_enough = component_height <= height * 0.06
+            if long_enough and narrow_enough:
+                retained[labels == label] = 255
+        return retained
+
+    mask = retain_long_components(vertical, vertical_axis=True)
+    mask |= retain_long_components(horizontal, vertical_axis=False)
+    expansion = max(1, round(min(width, height) * 0.0015))
+    return np.asarray(
+        cv2.dilate(mask, np.ones((expansion * 2 + 1, expansion * 2 + 1), np.uint8)),
+        dtype=np.uint8,
+    )
+
+
+def _remove_boundary_scanner_rails(pixels: np.ndarray) -> np.ndarray:
+    result = pixels.copy()
+    result[_boundary_scanner_rail_mask(result) > 0] = 255
+    return result
+
+
 def _remove_scanner_borders(pixels: np.ndarray) -> np.ndarray:
     """Remove boundary rails and punched holes while retaining nearby small ink."""
     result = pixels.copy()
-    height, width = pixels.shape[:2]
+    width = pixels.shape[1]
+    result = _remove_boundary_scanner_rails(result)
     edge = max(1, round(width * 0.012))
     result[:, :edge] = 255
     result[:, -edge:] = 255
-    dark = (cv2.cvtColor(result, cv2.COLOR_RGB2GRAY) < 140).astype(np.uint8)
-    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(dark, connectivity=8)
-    for label in range(1, count):
-        x, y, component_width, component_height, _area = stats[label]
-        touches_vertical_edge = x < width * 0.012 or x + component_width > width * 0.988
-        touches_horizontal_edge = y < height * 0.012 or y + component_height > height * 0.988
-        vertical_rail = (
-            touches_vertical_edge
-            and component_height > height * 0.04
-            and component_height > component_width * 4
-        )
-        horizontal_rail = (
-            touches_horizontal_edge
-            and component_width > width * 0.04
-            and component_width > component_height * 4
-        )
-        if vertical_rail or horizontal_rail:
-            component = (labels == label).astype(np.uint8)
-            short_edge = min(width, height)
-            dilation = max(3, round(short_edge * 0.004))
-            component = cv2.dilate(component, np.ones((dilation, dilation), np.uint8))
-            result[component > 0] = 255
     return _remove_punch_holes(result)
 
 
@@ -772,8 +981,16 @@ def _erase_punch_hole_preserving_nearby_ink(
     center_y: int,
     radius: int,
     padding: int,
+    *,
+    fill_from_surroundings: bool = False,
 ) -> np.ndarray:
-    """Whiten a blank punch and halo without clipping ink in its safety padding."""
+    """Erase a punch and halo without clipping ink in its safety padding.
+
+    Initial paper cleanup uses pure white. A source-guided residual repair may sit
+    inside a preserved photographic mount or tinted panel gutter; in that case,
+    inpaint only the confirmed physical-hole footprint from its immediate
+    surroundings so a conspicuous white replacement circle is not introduced.
+    """
     original = pixels.copy()
     result = pixels.copy()
     gray = cv2.cvtColor(original, cv2.COLOR_RGB2GRAY)
@@ -792,7 +1009,30 @@ def _erase_punch_hole_preserving_nearby_ink(
 
     erase = np.zeros_like(gray, dtype=np.uint8)
     cv2.circle(erase, (center_x, center_y), radius + padding, 255, thickness=-1)
-    result[erase > 0] = 255
+    if fill_from_surroundings:
+        outer = np.zeros_like(gray, dtype=np.uint8)
+        cv2.circle(
+            outer,
+            (center_x, center_y),
+            radius + padding + max(3, round(padding * 0.60)),
+            255,
+            thickness=-1,
+        )
+        samples = original[(outer > 0) & (erase == 0)]
+        if samples.size:
+            sample_gray = cv2.cvtColor(samples.reshape(-1, 1, 3), cv2.COLOR_RGB2GRAY).ravel()
+            sample_chroma = samples.max(axis=1) - samples.min(axis=1)
+            paper_samples = samples[(sample_gray >= 180) & (sample_chroma <= 55)]
+        else:
+            paper_samples = samples
+        fill = (
+            np.median(paper_samples, axis=0).astype(np.uint8)
+            if len(paper_samples) >= 24
+            else np.array((255, 255, 255), dtype=np.uint8)
+        )
+        result[erase > 0] = fill
+    else:
+        result[erase > 0] = 255
 
     # The candidate gate considers only ink entering the actual hole core. A table
     # border, glyph, or signature may still enter the extra halo padding. Restore
@@ -813,7 +1053,13 @@ def _erase_punch_hole_preserving_nearby_ink(
         result[protected_mask] = original[protected_mask]
     # Independently segmented gray rim fragments are physical halo, not authored
     # strokes. Remove only their pale pixels after restoring nearby dark content.
-    result[(erase > 0) & (gray >= 145)] = 255
+    if fill_from_surroundings:
+        # Paper grain and a punch's independently segmented pale rim are not
+        # authored strokes. Reapply the local paper estimate to those pixels after
+        # restoring genuinely dark neighboring components.
+        result[(erase > 0) & (gray >= 145)] = fill
+    else:
+        result[(erase > 0) & (gray >= 145)] = 255
     return result
 
 
@@ -1399,6 +1645,7 @@ def erase_residual_punch_hole_regions(
             center_y,
             radius,
             padding,
+            fill_from_surroundings=True,
         )
     return Image.fromarray(result, "RGB")
 
@@ -1546,6 +1793,92 @@ def erase_localized_pale_artifacts(
     return Image.fromarray(pixels, "RGB")
 
 
+def localized_pale_artifact_regions(
+    candidate: Image.Image,
+    *,
+    limit: int = 4,
+) -> list[tuple[float, float, float, float]]:
+    """Find long, pale neutral fold or scanner traces without modeling content.
+
+    This detector is only a proposal source: the pipeline invokes it after a model
+    has identified a scanner-quality problem, then applies deterministic and
+    semantic gates to every proposed deletion. Dark rules, colored marks, and text
+    rows are excluded by their source intensity or dark-core density.
+    """
+
+    pixels = np.asarray(candidate.convert("RGB"))
+    height, width = pixels.shape[:2]
+    gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(pixels, cv2.COLOR_RGB2HSV)
+    photographic_mask = _photographic_region_mask(pixels)
+    neutral = ((gray >= 80) & (gray < 245) & (hsv[:, :, 1] < 30)).astype(np.uint8)
+    proposals: list[tuple[float, tuple[float, float, float, float]]] = []
+
+    def collect(horizontal: bool) -> None:
+        long_extent = width if horizontal else height
+        join_length = max(5, round(long_extent * 0.012))
+        support_length = max(25, round(long_extent * 0.18))
+        close_kernel = (
+            np.ones((3, join_length), np.uint8)
+            if horizontal
+            else np.ones((join_length, 3), np.uint8)
+        )
+        open_kernel = (
+            np.ones((1, support_length), np.uint8)
+            if horizontal
+            else np.ones((support_length, 1), np.uint8)
+        )
+        joined = cv2.morphologyEx(neutral, cv2.MORPH_CLOSE, close_kernel)
+        support = cv2.morphologyEx(joined, cv2.MORPH_OPEN, open_kernel)
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            support,
+            connectivity=8,
+        )
+        for label in range(1, count):
+            x, y, component_width, component_height, area = stats[label]
+            if horizontal:
+                if component_width < width * 0.18 or component_height > height * 0.035:
+                    continue
+                pad_x = max(2, round(width * 0.006))
+                pad_y = max(3, round(height * 0.006), component_height * 2)
+            else:
+                if component_height < height * 0.18 or component_width > width * 0.035:
+                    continue
+                pad_x = max(3, round(width * 0.006), component_width * 2)
+                pad_y = max(2, round(height * 0.006))
+            x1 = max(0, x - pad_x)
+            y1 = max(0, y - pad_y)
+            x2 = min(width, x + component_width + pad_x)
+            y2 = min(height, y + component_height + pad_y)
+            crop_gray = gray[y1:y2, x1:x2]
+            if crop_gray.size == 0 or float(np.mean(crop_gray < 80)) > 0.035:
+                continue
+            if float(np.mean(photographic_mask[y1:y2, x1:x2] > 0)) > 0.15:
+                # Long panel edges and the horizontal seams between repeated
+                # radiology/ultrasound frames are authored image structure. A
+                # scanner fold may be proposed only where it remains primarily on
+                # the paper surface, never through preserved photographic pixels.
+                continue
+            span = component_width / width if horizontal else component_height / height
+            density = area / max(1, component_width * component_height)
+            region = (
+                (0.0, y1 / height, 1.0, y2 / height)
+                if horizontal
+                else (x1 / width, 0.0, x2 / width, 1.0)
+            )
+            proposals.append(
+                (
+                    span * density,
+                    region,
+                )
+            )
+
+    collect(horizontal=True)
+    collect(horizontal=False)
+    proposals.sort(key=lambda item: item[0], reverse=True)
+    return [region for _score, region in proposals[:limit]]
+
+
 def _page_skew_angle(pixels: np.ndarray) -> float | None:
     """Estimate a small global page rotation from long near-horizontal evidence."""
     gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
@@ -1610,6 +1943,12 @@ def _photographic_region_mask(pixels: np.ndarray) -> np.ndarray:
     height, width = pixels.shape[:2]
     gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
     dark = (gray < 170).astype(np.uint8)
+    scanner_rails = _boundary_scanner_rail_mask(pixels)
+    # A narrow physical rail can connect to a nearby radiology panel through a
+    # few noisy pixels. Remove that confidently inferred boundary evidence before
+    # boxing photographic components; otherwise the preservation rectangle grows
+    # to include the scanner bed and beige paper margin around the authored image.
+    dark[scanner_rails > 0] = 0
     kernel = np.ones(
         (max(3, round(height * 0.002)), max(3, round(width * 0.003))),
         np.uint8,
@@ -1654,6 +1993,7 @@ def _photographic_region_mask(pixels: np.ndarray) -> np.ndarray:
     # column remains connected even when scanner illumination makes its upper
     # and lower halves differ by several gray levels.
     shaded = (gray < background_level - 10).astype(np.uint8)
+    shaded[scanner_rails > 0] = 0
     shade_kernel = np.ones(
         (max(5, round(height * 0.01)), max(5, round(width * 0.01))),
         np.uint8,
@@ -1685,6 +2025,14 @@ def _photographic_region_mask(pixels: np.ndarray) -> np.ndarray:
             or area / box_area < 0.65
         ):
             continue
+        shaded_component = shade_labels == label
+        if float(np.mean(result[shaded_component] > 0)) > 0.20:
+            # The dark/texture detector has already boxed the authored raster
+            # panels. Broad-tone morphology can bridge the narrow paper gutters
+            # between stacked images and turn a column of separate panels into one
+            # preservation rectangle. Do not let that secondary detector paste the
+            # beige gutters and old rail footprint back into the cleaned page.
+            continue
         # Broad low-detail shading connected to a page edge is characteristic of
         # scanner-bed shadows, lifted/curled paper edges, and capture occlusions.
         # Intentional shaded panels (forms, charts, radiographs) contain materially
@@ -1713,7 +2061,7 @@ def _photographic_region_mask(pixels: np.ndarray) -> np.ndarray:
             )
             if internal_edge_fraction < 0.06:
                 continue
-        component = (shade_labels == label).astype(np.uint8)
+        component = shaded_component.astype(np.uint8)
         dense_bounded_panel = not touches_page_edge and area / box_area >= 0.80
         if dense_bounded_panel:
             # A dense, bounded rectangular component is an authored form panel.
@@ -1810,6 +2158,9 @@ def source_preserving_cleanup(source: Image.Image) -> Image.Image:
     source_pixels = np.asarray(source.convert("RGB"))
     photographic_mask = _photographic_region_mask(source_pixels)
     cleaned = _clean_source(source.convert("RGB"))
+    chromatic_reference = cleaned.copy()
+    chromatic_mask = _authored_chromatic_mask(source_pixels)
+    chromatic_mask[photographic_mask > 0] = 0
     cleaned = _remove_paper_tone(cleaned)
     punch_holes = _merge_punch_hole_candidates(
         _punch_hole_candidates(source_pixels),
@@ -1835,6 +2186,7 @@ def source_preserving_cleanup(source: Image.Image) -> Image.Image:
             radius,
             padding,
         )
+    cleaned = _remove_isolated_scan_specks(cleaned, source_pixels)
     angle = _page_skew_angle(cleaned)
     cleaned = _rotate_page(cleaned, angle)
     cleaned = _remove_paper_tone(cleaned)
@@ -1851,6 +2203,24 @@ def source_preserving_cleanup(source: Image.Image) -> Image.Image:
                 borderValue=0,
             )
         cleaned[photographic_mask > 0] = preserved[photographic_mask > 0]
+    if np.any(chromatic_mask):
+        rotated_chromatic_reference = _rotate_page(chromatic_reference, angle)
+        if angle is not None:
+            height, width = chromatic_mask.shape
+            chromatic_mask = cv2.warpAffine(
+                chromatic_mask,
+                _page_rotation_matrix(source_pixels, angle),
+                (width, height),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+        cleaned[chromatic_mask > 0] = rotated_chromatic_reference[chromatic_mask > 0]
+    # A photographic bounding box can include a narrow scanner rail connected by
+    # sparse noise. Re-run only the boundary-run cleanup after panel/color restore;
+    # this cannot touch a full-bleed image because it requires a nearby transition
+    # back to light paper.
+    cleaned = _remove_boundary_scanner_rails(cleaned)
     cleaned = _remove_low_information_edge_artifacts(cleaned)
     return Image.fromarray(cleaned, "RGB")
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from paperclean.prompting import (
+    CANDIDATE_QUALITY_PROMPT,
     FEEDBACK_TEMPLATE,
     GENERATION_PROMPT,
     ORIENTATION_PROMPT,
@@ -17,6 +18,7 @@ from paperclean.prompting import (
 
 
 def test_all_primary_prompts_load_from_packaged_markdown() -> None:
+    assert load_prompt("candidate-quality.md") == CANDIDATE_QUALITY_PROMPT
     assert load_prompt("generation.md") == GENERATION_PROMPT
     assert load_prompt("orientation.md") == ORIENTATION_PROMPT
     assert load_prompt("page-location.md") == PAGE_LOCATION_PROMPT
@@ -48,6 +50,20 @@ def test_review_prompt_explains_artificial_regional_crop_boundaries() -> None:
     assert "exact same intentional" in REVIEW_PROMPT and "crop from a larger page" in REVIEW_PROMPT
     assert "artificial verification-tile edges" in REVIEW_PROMPT
     assert "Never report" in REVIEW_PROMPT and "cropped_content" in REVIEW_PROMPT
+
+
+def test_review_prompt_distinguishes_print_characteristics_from_scan_defects() -> None:
+    assert "halftone logo texture" in REVIEW_PROMPT
+    assert "not scan\ndefects" in REVIEW_PROMPT
+    assert "tight actionable boxes" in REVIEW_PROMPT
+    assert "full-page umbrella box" in REVIEW_PROMPT
+
+
+def test_candidate_quality_prompt_is_source_independent_and_evidence_safe() -> None:
+    assert "Inspect only the cleaned CANDIDATE" in CANDIDATE_QUALITY_PROMPT
+    assert "not a comparison with\nthe original" in CANDIDATE_QUALITY_PROMPT
+    assert "Preserved authored evidence is not a capture defect" in CANDIDATE_QUALITY_PROMPT
+    assert "only scanner_quality discrepancies" in CANDIDATE_QUALITY_PROMPT
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,7 @@ from paperclean.models import Discrepancy, PageGeometry
 from paperclean.prompting import PUNCH_HOLE_REPAIR_PROMPT
 from paperclean.restoration import (
     REGIONAL_REPAIR_PROMPT,
+    _boundary_scanner_rail_mask,
     _photographic_region_mask,
     _punch_hole_candidates,
     _remove_low_information_edge_artifacts,
@@ -21,6 +22,7 @@ from paperclean.restoration import (
     erase_localized_pale_artifacts,
     erase_residual_punch_hole_regions,
     has_preserved_photographic_regions,
+    localized_pale_artifact_regions,
     photographed_page_cleanup,
     rectify_page_geometry,
     rectify_photographed_page,
@@ -568,6 +570,100 @@ def test_source_preserving_cleanup_removes_rails_and_punches_but_keeps_content()
     assert result.getpixel((300, 300)) == (255, 255, 255)
 
 
+def test_source_cleanup_preserves_pale_chromatic_logo_while_whitening_paper() -> None:
+    source = Image.new("RGB", (800, 1000), (240, 225, 205))
+    draw = ImageDraw.Draw(source)
+    draw.ellipse((560, 45, 690, 175), fill=(228, 201, 157), width=8)
+    draw.ellipse((595, 80, 655, 140), fill=(240, 225, 205))
+
+    cleaned = source_preserving_cleanup(source)
+
+    assert cleaned.getpixel((625, 55)) != (255, 255, 255)
+    assert cleaned.getpixel((400, 300)) == (255, 255, 255)
+
+
+def test_source_cleanup_removes_boundary_rail_without_following_noise_into_photo() -> None:
+    pixels = np.full((1000, 800, 3), 235, dtype=np.uint8)
+    pixels[:, :5] = 0
+    y1, y2, x1, x2 = 180, 580, 80, 680
+    yy, xx = np.mgrid[y1:y2, x1:x2]
+    texture = ((xx * 7 + yy * 11) % 150).astype(np.uint8)
+    pixels[y1:y2, x1:x2] = np.stack((texture, texture, texture), axis=2)
+    for x in range(5, x1, 4):
+        pixels[y1, x] = 0
+
+    cleaned = np.asarray(source_preserving_cleanup(Image.fromarray(pixels, "RGB")))
+
+    assert np.all(cleaned[:, :8] == 255)
+    assert np.array_equal(cleaned[y1 + 20 : y2, x1:x2], pixels[y1 + 20 : y2, x1:x2])
+
+
+def test_source_cleanup_infers_rail_boundary_where_it_meets_photo_panel() -> None:
+    pixels = np.full((1000, 800, 3), 235, dtype=np.uint8)
+    pixels[:, :35] = 0
+    y1, y2, x1, x2 = 250, 700, 35, 700
+    yy, xx = np.mgrid[y1:y2, x1:x2]
+    texture = ((xx * 7 + yy * 11) % 150).astype(np.uint8)
+    pixels[y1:y2, x1:x2] = np.stack((texture, texture, texture), axis=2)
+
+    rail_mask = _boundary_scanner_rail_mask(pixels)
+
+    assert np.all(rail_mask[:, :32] == 255)
+    assert np.all(rail_mask[y1:y2, 80:x2] == 0)
+
+
+def test_source_cleanup_removes_only_isolated_pale_neutral_specks() -> None:
+    source = Image.new("RGB", (800, 1000), (245, 245, 245))
+    draw = ImageDraw.Draw(source)
+    draw.rectangle((100, 100, 112, 150), fill=(30, 30, 30))
+    draw.rectangle((104, 91, 107, 94), fill=(185, 185, 185))
+    draw.rectangle((500, 500, 501, 501), fill=(190, 190, 190))
+    draw.rectangle((600, 500, 601, 501), fill=(80, 80, 190))
+    draw.rectangle((700, 500, 701, 501), fill=(80, 80, 80))
+    draw.rectangle((500, 600, 501, 601), fill=(185, 185, 185))
+    draw.rectangle((504, 600, 505, 601), fill=(185, 185, 185))
+
+    result = source_preserving_cleanup(source)
+
+    assert result.getpixel((501, 501)) == (255, 255, 255)
+    assert result.getpixel((105, 92)) != (255, 255, 255)
+    assert result.getpixel((601, 501)) != (255, 255, 255)
+    assert result.getpixel((701, 501)) != (255, 255, 255)
+    assert result.getpixel((500, 600)) != (255, 255, 255)
+    assert result.getpixel((504, 600)) != (255, 255, 255)
+
+
+def test_localized_pale_artifact_regions_find_folds_but_not_dark_rules() -> None:
+    source = Image.new("RGB", (800, 1000), "white")
+    draw = ImageDraw.Draw(source)
+    draw.line((20, 300, 780, 300), fill=(185, 185, 185), width=2)
+    draw.line((40, 700, 760, 700), fill=(195, 195, 195), width=3)
+    draw.line((20, 200, 780, 200), fill=(35, 35, 35), width=3)
+    draw.text((100, 500), "AUTHORED TEXT ROW", fill=(40, 40, 40))
+
+    regions = localized_pale_artifact_regions(source)
+
+    centers = sorted((top + bottom) / 2 for _left, top, _right, bottom in regions)
+    assert any(abs(center - 0.30) < 0.02 for center in centers)
+    assert any(abs(center - 0.70) < 0.02 for center in centers)
+    assert all(abs(center - 0.20) > 0.02 for center in centers)
+    assert all(left == 0.0 and right == 1.0 for left, _top, right, _bottom in regions)
+
+
+def test_localized_pale_artifact_regions_ignore_preserved_photo_structure(monkeypatch) -> None:
+    source = Image.new("RGB", (800, 1000), "white")
+    ImageDraw.Draw(source).line((20, 300, 780, 300), fill=(185, 185, 185), width=3)
+    assert localized_pale_artifact_regions(source)
+    photographic = np.zeros((1000, 800), dtype=np.uint8)
+    photographic[275:325, :] = 255
+    monkeypatch.setattr(
+        "paperclean.restoration._photographic_region_mask",
+        lambda _pixels: photographic,
+    )
+
+    assert localized_pale_artifact_regions(source) == []
+
+
 def test_source_cleanup_keeps_a_punch_hole_that_touches_authored_ink() -> None:
     source = Image.new("RGB", (500, 700), (238, 225, 205))
     draw = ImageDraw.Draw(source)
@@ -749,6 +845,21 @@ def test_residual_punch_erase_preserves_adjacent_restored_text() -> None:
     assert fixed.getpixel((80, 300)) == (0, 0, 0)
 
 
+def test_residual_punch_erase_continues_tinted_mount_instead_of_drawing_white_circle() -> None:
+    pixels = np.full((400, 300, 3), (224, 214, 198), dtype=np.uint8)
+    cv2.circle(pixels, (24, 180), 14, (5, 5, 5), thickness=-1)
+    candidate = Image.fromarray(pixels, "RGB")
+
+    fixed = erase_residual_punch_hole_regions(candidate, [(0.02, 0.39, 0.14, 0.51)])
+
+    center = fixed.getpixel((24, 180))
+    assert all(
+        abs(actual - expected) <= 8
+        for actual, expected in zip(center, (224, 214, 198), strict=True)
+    )
+    assert center != (255, 255, 255)
+
+
 def test_edge_artifact_erase_preserves_components_crossing_review_region() -> None:
     pixels = np.full((600, 400, 3), 255, dtype=np.uint8)
     cv2.rectangle(pixels, (60, 2), (66, 7), (170, 170, 170), thickness=-1)
@@ -892,6 +1003,22 @@ def test_photographic_panel_survives_thin_noise_bridge_to_scan_border() -> None:
     mask = _photographic_region_mask(pixels)
 
     assert mask[(y1 + y2) // 2, (x1 + x2) // 2] == 255
+    assert mask[500, 2] == 0
+
+
+def test_photographic_mask_does_not_bridge_paper_gutter_between_stacked_panels() -> None:
+    pixels = np.full((1000, 800, 3), (235, 225, 205), dtype=np.uint8)
+    x1, x2 = 100, 700
+    for y1, y2 in ((100, 400), (420, 720)):
+        yy, xx = np.mgrid[y1:y2, x1:x2]
+        texture = ((xx * 7 + yy * 11) % 150).astype(np.uint8)
+        pixels[y1:y2, x1:x2] = np.stack((texture, texture, texture), axis=2)
+
+    mask = _photographic_region_mask(pixels)
+
+    assert mask[250, 400] == 255
+    assert mask[570, 400] == 255
+    assert mask[410, 400] == 0
 
 
 def test_source_cleanup_keeps_large_shaded_form_panel_exact() -> None:
