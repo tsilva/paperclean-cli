@@ -107,9 +107,11 @@ def test_agentbridge_client_runs_preflight_generation_and_structured_review() ->
             candidate,
             view_name="full page",
         )
+        quality_verdict = client.review_quality(candidate, view_name="full page")
 
     assert candidate.size == (16, 20)
     assert verdict.accepted is True
+    assert quality_verdict.accepted is True
     assert projection.billing_mode == "codex_subscription"
     assert projection.backend_version == "0.1.9"
     assert projection.one_pass.cost_usd is None
@@ -121,9 +123,12 @@ def test_agentbridge_client_runs_preflight_generation_and_structured_review() ->
     assert calls[1][0] == "/api/v1/chat/completions"
     assert calls[1][1]["store"] is False
     assert calls[1][1]["response_format"]["type"] == "json_schema"
-    assert client.costs.prompt_tokens == 7
-    assert client.costs.completion_tokens == 3
-    assert client.costs.total_tokens == 10
+    quality_content = calls[2][1]["messages"][1]["content"]
+    assert sum(item.get("type") == "image_url" for item in quality_content) == 1
+    assert all(item.get("text") != "ORIGINAL:" for item in quality_content)
+    assert client.costs.prompt_tokens == 11
+    assert client.costs.completion_tokens == 4
+    assert client.costs.total_tokens == 15
 
 
 def test_agentbridge_preflight_rejects_missing_strict_capability() -> None:

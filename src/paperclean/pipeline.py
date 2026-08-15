@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+import math
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import cv2
+import numpy as np
 from PIL import Image
 
 from paperclean.config import Settings
@@ -57,6 +60,7 @@ from paperclean.restoration import (
     erase_localized_pale_artifacts,
     erase_residual_punch_hole_regions,
     has_preserved_photographic_regions,
+    localized_pale_artifact_regions,
     photographed_page_cleanup,
     rectify_page_geometry,
     rectify_source_to_reference,
@@ -132,6 +136,169 @@ def _review_view(
             if exc.error_type not in {"timeout", "timeout_error"} or timeout_attempt:
                 raise
     raise ReviewerResponseError("reviewer did not produce a verdict")
+
+
+def _review_quality_view(
+    client: ModelClient,
+    candidate: Image.Image,
+    *,
+    view_name: str,
+) -> ReviewVerdict:
+    """Run a candidate-only quality judgment with the normal retry contract."""
+
+    for timeout_attempt in range(2):
+        try:
+            for schema_attempt in range(2):
+                try:
+                    return client.review_quality(candidate, view_name=view_name)
+                except ReviewerResponseError:
+                    if schema_attempt:
+                        raise
+        except ProviderError as exc:
+            if exc.error_type not in {"timeout", "timeout_error"} or timeout_attempt:
+                raise
+    raise ReviewerResponseError("quality reviewer did not produce a verdict")
+
+
+def _candidate_quality_accepts(
+    client: ModelClient,
+    candidate: Image.Image,
+) -> tuple[bool, list[Discrepancy]]:
+    """Judge capture defects without anchoring the model on a degraded source.
+
+    Content identity remains governed by the registered side-by-side verifier. This
+    independent gate sees only the candidate, so authentic source texture cannot be
+    mistaken for a defect merely because it differs from cleanup. A quality rejection
+    still requires two of three judgments for the affected view.
+    """
+
+    view_pairs = review_view_pairs(candidate, candidate)
+    for index, (_unused, candidate_view) in enumerate(view_pairs):
+        view_name = "full page" if index == 0 else f"region {index} of 4"
+        verdicts = [
+            _review_quality_view(
+                client,
+                candidate_view,
+                view_name=view_name,
+            )
+        ]
+        if verdicts[0].accepted:
+            continue
+        verdicts.extend(
+            _review_quality_view(client, candidate_view, view_name=view_name) for _ in range(2)
+        )
+        accepted_verdicts = [item for item in verdicts if item.accepted]
+        if len(accepted_verdicts) >= 2:
+            continue
+        rejected_verdicts = [item for item in verdicts if not item.accepted]
+        verdict = rejected_verdicts[0]
+        view_discrepancies = list(verdict.discrepancies) or [
+            Discrepancy("scanner_quality", "high", (0.0, 0.0, 1.0, 1.0))
+        ]
+        view_box = (
+            (0, 0, candidate.width, candidate.height)
+            if index == 0
+            else review_boxes(candidate.size)[index - 1]
+        )
+        view_left, view_top, view_right, view_bottom = view_box
+        view_width = view_right - view_left
+        view_height = view_bottom - view_top
+        discrepancies = [
+            Discrepancy(
+                category="scanner_quality",
+                severity=item.severity,
+                region=(
+                    (view_left + item.region[0] * view_width) / candidate.width,
+                    (view_top + item.region[1] * view_height) / candidate.height,
+                    (view_left + item.region[2] * view_width) / candidate.width,
+                    (view_top + item.region[3] * view_height) / candidate.height,
+                ),
+            )
+            for item in view_discrepancies
+        ]
+        return False, discrepancies
+    return True, []
+
+
+def _quality_repair_accepts(
+    client: ModelClient,
+    candidate: Image.Image,
+    region: tuple[float, float, float, float],
+) -> bool:
+    """Confirm that one proposed repair actually cleared its target region."""
+
+    left, top, right, bottom = _expanded_quality_repair_context(region)
+    crop_box = (
+        max(0, math.floor(left * candidate.width)),
+        max(0, math.floor(top * candidate.height)),
+        min(candidate.width, math.ceil(right * candidate.width)),
+        min(candidate.height, math.ceil(bottom * candidate.height)),
+    )
+    crop = candidate.crop(crop_box)
+    verdicts = [
+        _review_quality_view(
+            client,
+            crop,
+            view_name="region 1 of 1",
+        )
+    ]
+    if verdicts[0].accepted:
+        return True
+    verdicts.extend(_review_quality_view(client, crop, view_name="region 1 of 1") for _ in range(2))
+    return sum(item.accepted for item in verdicts) >= 2
+
+
+def _margin_region_metrics(
+    candidate: Image.Image,
+    region: tuple[float, float, float, float],
+) -> tuple[int, int, int]:
+    left, top, right, bottom = region
+    width, height = candidate.size
+    box = (
+        max(0, math.floor(left * width)),
+        max(0, math.floor(top * height)),
+        min(width, math.ceil(right * width)),
+        min(height, math.ceil(bottom * height)),
+    )
+    pixels = np.asarray(candidate.convert("RGB"))[box[1] : box[3], box[0] : box[2]]
+    if pixels.size == 0:
+        return 0, 0, 0
+    gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(pixels, cv2.COLOR_RGB2HSV)
+    foreground = gray < 250
+    return int(foreground.sum()), int((foreground & (hsv[:, :, 1] >= 45)).sum()), gray.size
+
+
+def _margin_artifact_cleared(
+    before: Image.Image,
+    after: Image.Image,
+    region: tuple[float, float, float, float],
+) -> bool:
+    """Confirm objective removal of one sparse neutral outer-margin component."""
+
+    left, top, right, bottom = region
+    if not (left <= 0.001 or top <= 0.001 or right >= 0.999 or bottom >= 0.999):
+        return False
+    before_count, before_colored, area = _margin_region_metrics(before, region)
+    after_count, _after_colored, after_area = _margin_region_metrics(after, region)
+    if area == 0 or after_area != area:
+        return False
+    sparse_limit = max(3, round(area * 0.12))
+    clean_limit = max(2, round(area * 0.002))
+    return (
+        clean_limit < before_count <= sparse_limit
+        and before_colored == 0
+        and after_count <= clean_limit
+        and after_count <= before_count * 0.10
+    )
+
+
+def _margin_region_is_clean(
+    candidate: Image.Image,
+    region: tuple[float, float, float, float],
+) -> bool:
+    count, _colored, area = _margin_region_metrics(candidate, region)
+    return area > 0 and count <= max(2, round(area * 0.002))
 
 
 def _quality_only_rejection(verdict: ReviewVerdict) -> bool:
@@ -347,7 +514,7 @@ _MAX_AUTHORED_HOLE_REPAIRS = 2
 _MAX_AUTHORED_HOLE_REPAIR_ATTEMPTS = 3
 _MAX_SOURCE_REGION_RECOVERY_PASSES = 4
 _MAX_PHOTO_QUALITY_REPAIRS = 2
-_MAX_SCAN_QUALITY_REPAIRS = 4
+_MAX_SCAN_QUALITY_REPAIRS = 8
 _SOURCE_EVIDENCE_RECOVERY_CATEGORIES = {
     "changed_text",
     "missing_text",
@@ -395,17 +562,20 @@ def _localized_quality_repair_region(
         return None
     pad_x = max(0.01, min(0.03, raw_width * 0.08))
     pad_y = max(0.01, min(0.04, raw_height * 0.50))
+    inward_pad_x = min(pad_x, 0.005) if left <= 0.03 or right >= 0.97 else pad_x
+    inward_pad_y = min(pad_y, 0.005) if top <= 0.03 or bottom >= 0.97 else pad_y
     region = (
-        max(0.0, left - pad_x),
-        max(0.0, top - pad_y),
-        min(1.0, right + pad_x),
-        min(1.0, bottom + pad_y),
+        0.0 if left <= 0.03 else max(0.0, left - inward_pad_x),
+        0.0 if top <= 0.03 else max(0.0, top - inward_pad_y),
+        1.0 if right >= 0.97 else min(1.0, right + inward_pad_x),
+        1.0 if bottom >= 0.97 else min(1.0, bottom + inward_pad_y),
     )
     left, top, right, bottom = region
     width = right - left
     height = bottom - top
     if (
         width * height > 0.15
+        or (width > 0.25 and height > 0.25)
         or (width > 0.75 and height > 0.10)
         or (height > 0.65 and width > 0.10)
         or (width > 0.55 and height > 0.15)
@@ -413,6 +583,111 @@ def _localized_quality_repair_region(
     ):
         return None
     return region
+
+
+def _quality_region_orientation(region: tuple[float, float, float, float]) -> str:
+    left, top, right, bottom = region
+    width = right - left
+    height = bottom - top
+    if height <= 0.12 and width >= 0.20:
+        return "horizontal"
+    if width <= 0.12 and height >= 0.20:
+        return "vertical"
+    return "local"
+
+
+def _same_quality_target(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> bool:
+    """Identify duplicate verifier boxes for one physical scan defect."""
+
+    first_orientation = _quality_region_orientation(first)
+    if first_orientation != _quality_region_orientation(second):
+        return False
+    overlap_width = max(0.0, min(first[2], second[2]) - max(first[0], second[0]))
+    overlap_height = max(0.0, min(first[3], second[3]) - max(first[1], second[1]))
+    first_width = first[2] - first[0]
+    second_width = second[2] - second[0]
+    first_height = first[3] - first[1]
+    second_height = second[3] - second[1]
+    if first_orientation == "horizontal":
+        return (
+            overlap_height >= min(first_height, second_height) * 0.50
+            and overlap_width >= min(first_width, second_width) * 0.50
+        )
+    if first_orientation == "vertical":
+        return (
+            overlap_width >= min(first_width, second_width) * 0.50
+            and overlap_height >= min(first_height, second_height) * 0.50
+        )
+    overlap_area = overlap_width * overlap_height
+    smaller_area = min(first_width * first_height, second_width * second_height)
+    return smaller_area > 0 and overlap_area >= smaller_area * 0.60
+
+
+def _localized_quality_repair_regions(
+    discrepancies: list[Discrepancy],
+    *,
+    limit: int = _MAX_SCAN_QUALITY_REPAIRS,
+) -> list[tuple[float, float, float, float]]:
+    """Return distinct bounded repair targets, prioritizing stronger evidence."""
+
+    severity_rank = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+    candidates: list[tuple[int, int, tuple[float, float, float, float]]] = []
+    for index, discrepancy in enumerate(discrepancies):
+        region = _localized_quality_repair_region([discrepancy])
+        if region is not None:
+            candidates.append((severity_rank.get(discrepancy.severity, 0), index, region))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    selected: list[tuple[float, float, float, float]] = []
+    for _severity, _index, region in candidates:
+        duplicate_index = next(
+            (
+                index
+                for index, existing in enumerate(selected)
+                if _same_quality_target(existing, region)
+            ),
+            None,
+        )
+        if duplicate_index is not None:
+            existing = selected[duplicate_index]
+            existing_area = (existing[2] - existing[0]) * (existing[3] - existing[1])
+            region_area = (region[2] - region[0]) * (region[3] - region[1])
+            if region_area > existing_area:
+                selected[duplicate_index] = region
+            continue
+        selected.append(region)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _nonactionable_low_quality_only(
+    discrepancies: list[Discrepancy],
+    *,
+    attempted_quality_regions: Sequence[tuple[float, float, float, float]] = (),
+) -> bool:
+    """Identify cosmetic warnings with no remaining safe repair action.
+
+    A broad low-severity warning cannot select a bounded repair at all. A tight low
+    warning becomes equally non-actionable after its physical target has already
+    received one deterministic and one model-assisted proposal and both failed the
+    fidelity/quality gates. In either case, falling back to the visibly dirtier
+    original is worse than publishing the content-verified source cleanup.
+    """
+
+    if not discrepancies:
+        return False
+    for item in discrepancies:
+        if item.category != "scanner_quality" or item.severity != "low":
+            return False
+        region = _localized_quality_repair_region([item])
+        if region is not None and not any(
+            _same_quality_target(region, attempted) for attempted in attempted_quality_regions
+        ):
+            return False
+    return True
 
 
 def _expanded_quality_repair_context(
@@ -721,6 +996,7 @@ def _try_source_first_cleanup(
                 client=client,
                 finalize_candidate=finalize_candidate,
                 source_page_dpi=source_page_dpi,
+                prefer_deterministic_erase=True,
                 repair_erased_holes=True,
             )
         except (ContentPolicyError, ReviewerResponseError, ProviderError) as exc:
@@ -783,70 +1059,71 @@ def _try_source_first_cleanup(
         and discrepancies
         and all(item.category == "scanner_quality" for item in discrepancies)
     ):
-        quality_regions = [
-            region
-            for item in discrepancies
-            if (region := _localized_quality_repair_region([item])) is not None
-        ]
-        quality_regions = list(dict.fromkeys(quality_regions))[:_MAX_SCAN_QUALITY_REPAIRS]
-        record.localized_quality_regions = quality_regions
-        committed_repair = False
         proposed_tolerated_categories = _MODEL_ASSISTED_CLEANUP_TOLERATED_CATEGORIES
         if has_preserved_photographic_regions(source):
             proposed_tolerated_categories = proposed_tolerated_categories | {"changed_diagram"}
-        for quality_region in quality_regions:
-            # Each region is an independent transaction against the current
-            # content-safe candidate. Do not rediscover quality boxes after every
-            # commit; the original all-view verdict is the bounded repair queue.
-            deterministic_recreation = erase_contained_edge_artifacts(
-                recreation,
-                quality_region,
+        has_candidate_quality_reviewer = callable(getattr(client, "review_quality", None))
+        cleared_detector_regions: list[tuple[float, float, float, float]] = []
+        cleared_margin_regions: list[tuple[float, float, float, float]] = []
+
+        def adjudicate_candidate_quality() -> tuple[bool, list[Discrepancy]]:
+            if not has_candidate_quality_reviewer:
+                return accepted, discrepancies
+            quality_accepted, quality_discrepancies = _candidate_quality_accepts(client, candidate)
+            detected = localized_pale_artifact_regions(
+                candidate,
+                limit=_MAX_SCAN_QUALITY_REPAIRS,
             )
-            deterministic_recreation = erase_localized_pale_artifacts(
-                deterministic_recreation,
-                quality_region,
-            )
-            if pixel_sha256(deterministic_recreation) != pixel_sha256(recreation):
-                proposed_recreation = deterministic_recreation
-            else:
-                repair_context = _expanded_quality_repair_context(quality_region)
-                proposed_recreation = repair_region(
-                    recreation,
-                    recreation,
-                    repair_context,
-                    client=client,
-                    max_edge=settings.max_reference_edge,
-                    paste_region=quality_region,
+            quality_discrepancies = [
+                item
+                for item in quality_discrepancies
+                if not (
+                    (
+                        any(
+                            _same_quality_target(item.region, cleared)
+                            for cleared in cleared_detector_regions
+                        )
+                        and not any(
+                            _same_quality_target(item.region, current) for current in detected
+                        )
+                    )
+                    or any(
+                        _same_quality_target(item.region, cleared)
+                        and _margin_region_is_clean(candidate, cleared)
+                        for cleared in cleared_margin_regions
+                    )
                 )
-            if pixel_sha256(proposed_recreation) == pixel_sha256(recreation):
-                record.rejected_quality_regions.append(quality_region)
-                continue
-            proposed_candidate = finalize_candidate(proposed_recreation)
-            proposed_deterministic = _validate_clean_candidate(
-                source,
-                proposed_candidate,
-                min_effective_dpi=settings.min_effective_dpi,
-                effective_dpi=source_page_dpi,
+            ]
+            if (quality_accepted or not quality_discrepancies) and not detected:
+                return True, []
+            combined = list(quality_discrepancies)
+            for region in detected:
+                if not any(_same_quality_target(region, item.region) for item in combined):
+                    combined.append(Discrepancy("scanner_quality", "medium", region))
+            return False, combined
+
+        accepted, discrepancies = adjudicate_candidate_quality()
+
+        def discover_quality_regions() -> list[tuple[float, float, float, float]]:
+            detected = localized_pale_artifact_regions(
+                candidate,
+                limit=_MAX_SCAN_QUALITY_REPAIRS,
             )
-            record.local_issues = proposed_deterministic.issues
-            if not proposed_deterministic.accepted:
-                record.rejected_quality_regions.append(quality_region)
-                continue
-            if not _incremental_content_accepts(
-                client,
-                source,
-                proposed_candidate,
-                quality_region,
-                tolerated_categories=proposed_tolerated_categories,
-            ):
-                record.rejected_quality_regions.append(quality_region)
-                continue
-            recreation = proposed_recreation
-            candidate = proposed_candidate
-            record.strategy = "model_assisted_source_cleanup"
-            record.committed_quality_regions.append(quality_region)
-            committed_repair = True
-        if committed_repair or not quality_regions:
+            reviewed = _localized_quality_repair_regions(
+                discrepancies,
+                limit=max(_MAX_SCAN_QUALITY_REPAIRS, len(discrepancies)),
+            )
+            combined: list[tuple[float, float, float, float]] = []
+            for region in [*detected, *reviewed]:
+                if not any(_same_quality_target(region, existing) for existing in combined):
+                    combined.append(region)
+            return combined
+
+        if not discover_quality_regions() and not has_candidate_quality_reviewer:
+            # A cheap all-view pass can describe a page-wide quality problem even
+            # when individual review consensus can localize its physical folds or
+            # scanner rails. Refine localization exactly once, then consume the
+            # resulting bounded queue without rediscovery or recursion.
             accepted, discrepancies = _verification_accepts(
                 client,
                 source,
@@ -856,6 +1133,160 @@ def _try_source_first_cleanup(
                 quality_consensus=True,
                 collect_all_views=True,
             )
+        attempted_quality_regions: list[tuple[float, float, float, float]] = []
+        while (
+            not accepted
+            and discrepancies
+            and all(item.category == "scanner_quality" for item in discrepancies)
+            and len(attempted_quality_regions) < _MAX_SCAN_QUALITY_REPAIRS
+        ):
+            remaining_budget = _MAX_SCAN_QUALITY_REPAIRS - len(attempted_quality_regions)
+            discovered_regions = discover_quality_regions()
+            quality_regions = [
+                region
+                for region in discovered_regions
+                if not any(
+                    _same_quality_target(region, attempted)
+                    for attempted in attempted_quality_regions
+                )
+            ][:remaining_budget]
+            if not quality_regions:
+                break
+            record.localized_quality_regions.extend(quality_regions)
+            committed_repair = False
+            for quality_region in quality_regions:
+                attempted_quality_regions.append(quality_region)
+                detector_supported = any(
+                    _same_quality_target(quality_region, detected)
+                    for detected in localized_pale_artifact_regions(
+                        candidate,
+                        limit=_MAX_SCAN_QUALITY_REPAIRS,
+                    )
+                )
+                # Each region is an independent transaction against the current
+                # content-safe candidate. Consensus can add newly visible defects,
+                # but the global proposal budget and geometric de-duplication make
+                # rediscovery finite and prevent revisiting the same physical mark.
+                deterministic_recreation = erase_contained_edge_artifacts(
+                    recreation,
+                    quality_region,
+                )
+                deterministic_recreation = erase_localized_pale_artifacts(
+                    deterministic_recreation,
+                    quality_region,
+                )
+
+                def accepted_proposal(
+                    proposed_recreation: Image.Image,
+                    *,
+                    current_recreation: Image.Image = recreation,
+                    current_candidate: Image.Image = candidate,
+                    target_region: tuple[float, float, float, float] = quality_region,
+                    detector_target: bool = detector_supported,
+                ) -> tuple[Image.Image, Image.Image] | None:
+                    if pixel_sha256(proposed_recreation) == pixel_sha256(current_recreation):
+                        return None
+                    proposed_candidate = finalize_candidate(proposed_recreation)
+                    proposed_deterministic = _validate_clean_candidate(
+                        source,
+                        proposed_candidate,
+                        min_effective_dpi=settings.min_effective_dpi,
+                        effective_dpi=source_page_dpi,
+                    )
+                    record.local_issues = proposed_deterministic.issues
+                    if not proposed_deterministic.accepted:
+                        return None
+                    if not _incremental_content_accepts(
+                        client,
+                        source,
+                        proposed_candidate,
+                        target_region,
+                        tolerated_categories=proposed_tolerated_categories,
+                    ):
+                        return None
+                    if has_candidate_quality_reviewer:
+                        detector_cleared = detector_target and not any(
+                            _same_quality_target(target_region, remaining)
+                            for remaining in localized_pale_artifact_regions(
+                                proposed_candidate,
+                                limit=_MAX_SCAN_QUALITY_REPAIRS,
+                            )
+                        )
+                        margin_cleared = _margin_artifact_cleared(
+                            current_candidate,
+                            proposed_candidate,
+                            target_region,
+                        )
+                        if (
+                            not detector_cleared
+                            and not margin_cleared
+                            and not _quality_repair_accepts(
+                                client,
+                                proposed_candidate,
+                                target_region,
+                            )
+                        ):
+                            return None
+                    return proposed_recreation, proposed_candidate
+
+                accepted_repair = accepted_proposal(deterministic_recreation)
+                if accepted_repair is None:
+                    repair_context = _expanded_quality_repair_context(quality_region)
+                    model_recreation = repair_region(
+                        recreation,
+                        recreation,
+                        repair_context,
+                        client=client,
+                        max_edge=settings.max_reference_edge,
+                        paste_region=quality_region,
+                    )
+                    accepted_repair = accepted_proposal(model_recreation)
+                if accepted_repair is None:
+                    record.rejected_quality_regions.append(quality_region)
+                    continue
+                previous_candidate = candidate
+                recreation, candidate = accepted_repair
+                if detector_supported and not any(
+                    _same_quality_target(quality_region, remaining)
+                    for remaining in localized_pale_artifact_regions(
+                        candidate,
+                        limit=_MAX_SCAN_QUALITY_REPAIRS,
+                    )
+                ):
+                    cleared_detector_regions.append(quality_region)
+                if _margin_artifact_cleared(previous_candidate, candidate, quality_region):
+                    cleared_margin_regions.append(quality_region)
+                record.strategy = "model_assisted_source_cleanup"
+                record.committed_quality_regions.append(quality_region)
+                committed_repair = True
+            if not committed_repair:
+                break
+            accepted, discrepancies = _verification_accepts(
+                client,
+                source,
+                candidate,
+                tolerated_categories=proposed_tolerated_categories,
+                confirm_rejections=True,
+                quality_consensus=True,
+                collect_all_views=True,
+            )
+            if (
+                not accepted
+                and discrepancies
+                and all(item.category == "scanner_quality" for item in discrepancies)
+            ):
+                # Reconfirm actual cleanliness independently after every committed
+                # batch. The comparison remains authoritative for content changes.
+                accepted, discrepancies = adjudicate_candidate_quality()
+        if not accepted and _nonactionable_low_quality_only(
+            discrepancies,
+            attempted_quality_regions=attempted_quality_regions,
+        ):
+            # Broad cosmetic warnings cannot safely select a regional repair and
+            # have already survived deterministic cleanup plus content verification.
+            # Preserve them in provenance, but do not let a low-severity umbrella
+            # box force publication of the visibly worse original scan.
+            accepted = True
     record.verification_categories = list(dict.fromkeys(item.category for item in discrepancies))
     record.verification_discrepancies = list(discrepancies)
     record.accepted = accepted

@@ -15,10 +15,14 @@ from paperclean.models import Discrepancy, PageGeometry, ReviewVerdict
 from paperclean.openrouter import CostTracker
 from paperclean.pipeline import (
     GENERATION_PROMPT,
+    _candidate_quality_accepts,
     _expanded_hole_paste_region,
     _expanded_hole_repair_context,
     _expanded_quality_repair_context,
     _localized_quality_repair_region,
+    _margin_artifact_cleared,
+    _nonactionable_low_quality_only,
+    _quality_repair_accepts,
     _validate_clean_candidate,
     clean_image,
     report_has_fallback,
@@ -93,6 +97,197 @@ def test_generation_prompt_prioritizes_footer_sharpness_and_global_alignment() -
     assert "straight level baselines" in GENERATION_PROMPT
     assert all(word in GENERATION_PROMPT for word in ("blurred", "ghosted", "doubled"))
     assert "single coordinate system" in GENERATION_PROMPT
+
+
+def test_candidate_quality_rejection_requires_two_of_three_consensus() -> None:
+    class TransientQualityClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.quality_calls = 0
+
+        def review_quality(self, _candidate: Image.Image, *, view_name: str) -> ReviewVerdict:
+            assert view_name
+            self.quality_calls += 1
+            if self.quality_calls == 1:
+                return ReviewVerdict(
+                    content_match=True,
+                    scanner_quality=False,
+                    discrepancies=[Discrepancy("scanner_quality", "medium", (0.2, 0.3, 0.8, 0.4))],
+                )
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = TransientQualityClient()
+    accepted, discrepancies = _candidate_quality_accepts(
+        client, Image.new("RGB", (300, 400), "white")
+    )  # type: ignore[arg-type]
+
+    assert accepted is True
+    assert discrepancies == []
+    assert client.quality_calls == 7
+
+
+def test_candidate_quality_preserves_confirmed_defect_region() -> None:
+    class DirtyCandidateClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.quality_calls = 0
+
+        def review_quality(self, _candidate: Image.Image, *, view_name: str) -> ReviewVerdict:
+            assert view_name == "full page"
+            self.quality_calls += 1
+            return ReviewVerdict(
+                content_match=True,
+                scanner_quality=False,
+                discrepancies=[Discrepancy("scanner_quality", "high", (0.1, 0.2, 0.9, 0.3))],
+            )
+
+    client = DirtyCandidateClient()
+    accepted, discrepancies = _candidate_quality_accepts(
+        client, Image.new("RGB", (300, 400), "white")
+    )  # type: ignore[arg-type]
+
+    assert accepted is False
+    assert discrepancies == [Discrepancy("scanner_quality", "high", (0.1, 0.2, 0.9, 0.3))]
+    assert client.quality_calls == 3
+
+
+def test_local_quality_repair_rejection_requires_consensus() -> None:
+    class TransientLocalQualityClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.quality_calls = 0
+
+        def review_quality(self, candidate: Image.Image, *, view_name: str) -> ReviewVerdict:
+            assert candidate.height < 400
+            assert view_name == "region 1 of 1"
+            self.quality_calls += 1
+            if self.quality_calls == 1:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = TransientLocalQualityClient()
+
+    assert (
+        _quality_repair_accepts(
+            client,
+            Image.new("RGB", (300, 400), "white"),
+            (0.1, 0.3, 0.9, 0.32),
+        )
+        is True
+    )  # type: ignore[arg-type]
+    assert client.quality_calls == 3
+
+
+def test_sparse_neutral_margin_component_has_objective_clearance() -> None:
+    before = Image.new("RGB", (100, 100), "white")
+    before.putpixel((45, 97), (40, 40, 40))
+    before.putpixel((46, 97), (40, 40, 40))
+    before.putpixel((45, 98), (40, 40, 40))
+    before.putpixel((46, 98), (40, 40, 40))
+    after = before.copy()
+    for x in (45, 46):
+        for y in (97, 98):
+            after.putpixel((x, y), (255, 255, 255))
+
+    assert _margin_artifact_cleared(before, after, (0.4, 0.95, 0.6, 1.0)) is True
+    assert _margin_artifact_cleared(before, after, (0.4, 0.90, 0.6, 0.99)) is False
+
+
+def test_only_broad_low_quality_warnings_are_nonactionable() -> None:
+    broad = Discrepancy("scanner_quality", "low", (0.02, 0.65, 0.69, 0.81))
+    local = Discrepancy("scanner_quality", "low", (0.01, 0.12, 0.02, 0.14))
+    stronger = Discrepancy("scanner_quality", "medium", broad.region)
+
+    assert _nonactionable_low_quality_only([broad]) is True
+    assert _nonactionable_low_quality_only([local]) is False
+    assert (
+        _nonactionable_low_quality_only(
+            [local],
+            attempted_quality_regions=[(0.0, 0.11, 0.025, 0.15)],
+        )
+        is True
+    )
+    assert _nonactionable_low_quality_only([stronger]) is False
+
+
+def test_source_cleanup_uses_candidate_only_gate_for_quality_only_comparison(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline._verification_accepts",
+        lambda *_args, **_kwargs: (
+            False,
+            [Discrepancy("scanner_quality", "medium", (0.0, 0.0, 1.0, 1.0))],
+        ),
+    )
+    monkeypatch.setattr("paperclean.pipeline.localized_pale_artifact_regions", lambda *_a, **_k: [])
+
+    class CleanCandidateClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.quality_calls = 0
+
+        def review_quality(self, _candidate: Image.Image, *, view_name: str) -> ReviewVerdict:
+            assert view_name
+            self.quality_calls += 1
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = CleanCandidateClient()
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="fake", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    assert report.pages[0].status == "source_preserving_clean"
+    assert report.pages[0].attempts[-1].verification_categories == []
+    assert client.quality_calls == 5
+
+
+def test_source_cleanup_records_broad_low_quality_warning_without_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    broad = Discrepancy("scanner_quality", "low", (0.02, 0.65, 0.69, 0.81))
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline._verification_accepts",
+        lambda *_args, **_kwargs: (False, [broad]),
+    )
+    monkeypatch.setattr("paperclean.pipeline.localized_pale_artifact_regions", lambda *_a, **_k: [])
+
+    class BroadWarningClient(FakeClient):
+        def review_quality(self, _candidate: Image.Image, *, view_name: str) -> ReviewVerdict:
+            assert view_name == "full page"
+            return ReviewVerdict(
+                content_match=True,
+                scanner_quality=False,
+                discrepancies=[broad],
+            )
+
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        BroadWarningClient(),
+        force=False,
+    )  # type: ignore[arg-type]
+
+    attempt = report.pages[0].attempts[0]
+    assert report.pages[0].status == "source_preserving_clean"
+    assert attempt.accepted is True
+    assert attempt.verification_discrepancies == [broad]
+    assert attempt.verification_categories == ["scanner_quality"]
 
 
 def test_clean_image_accepts_only_after_five_model_verifications(
@@ -1147,6 +1342,58 @@ def test_generated_candidate_erases_isolated_hole_before_regional_generation(
     assert report.pages[0].attempts[0].local_issues == []
 
 
+def test_source_cleanup_erases_residual_hole_before_probable_reconstruction(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    residual_region = (0.0, 0.32, 0.08, 0.38)
+    erased = False
+    events: list[str] = []
+    monkeypatch.setattr(
+        "paperclean.pipeline.source_preserving_cleanup", lambda source: source.copy()
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.authored_punch_hole_regions",
+        lambda _source: [(0.0, 0.3, 0.3, 0.4)],
+    )
+
+    def residual(source_image, candidate):
+        if candidate is source_image:
+            return [residual_region]
+        return [] if erased else [residual_region]
+
+    monkeypatch.setattr("paperclean.pipeline.residual_punch_hole_regions", residual)
+
+    def erase(candidate, _regions):
+        nonlocal erased
+        events.append("erase")
+        erased = True
+        return candidate
+
+    def repair(_source, candidate, *_args, **_kwargs):
+        events.append("repair")
+        return candidate
+
+    monkeypatch.setattr("paperclean.pipeline.erase_residual_punch_hole_regions", erase)
+    monkeypatch.setattr("paperclean.pipeline.repair_region", repair)
+
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="fake", backend="agentbridge", max_attempts=1),
+        FakeClient(),
+        force=False,
+    )  # type: ignore[arg-type]
+
+    assert events == ["erase", "repair"]
+    assert report.pages[0].status == "model_assisted_clean"
+    assert report.pages[0].attempts[0].local_issues == []
+
+
 def test_residual_authored_hole_routes_to_regional_repair_before_review(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1561,6 +1808,154 @@ def test_source_cleanup_repairs_only_localized_quality_regions(tmp_path: Path, m
     assert report.pages[0].attempts[0].accepted is True
 
 
+def test_source_cleanup_refines_broad_quality_localization_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.residual_punch_hole_regions",
+        lambda *_args: [],
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.authored_punch_hole_regions",
+        lambda _source: [],
+    )
+    verification_results = iter(
+        [
+            (False, [Discrepancy("scanner_quality", "medium", (0.0, 0.0, 1.0, 1.0))]),
+            (
+                False,
+                [
+                    Discrepancy("scanner_quality", "medium", (0.01, 0.33, 0.98, 0.35)),
+                    Discrepancy("scanner_quality", "medium", (0.01, 0.335, 0.55, 0.352)),
+                ],
+            ),
+            (True, []),
+        ]
+    )
+    consensus_flags: list[bool] = []
+
+    def verify(*_args, **kwargs):
+        consensus_flags.append(kwargs["quality_consensus"])
+        return next(verification_results)
+
+    monkeypatch.setattr("paperclean.pipeline._verification_accepts", verify)
+    monkeypatch.setattr(
+        "paperclean.pipeline._incremental_content_accepts",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.erase_contained_edge_artifacts",
+        lambda candidate, _region: candidate,
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.erase_localized_pale_artifacts",
+        lambda candidate, _region: candidate,
+    )
+    repair_contexts: list[tuple[float, float, float, float]] = []
+    repair_paste_regions: list[tuple[float, float, float, float]] = []
+
+    def repair(_repair_source, candidate, region, *_args, **kwargs):
+        repair_contexts.append(region)
+        repair_paste_regions.append(kwargs["paste_region"])
+        changed = candidate.copy()
+        changed.putpixel((1, 0), (250, 250, 250))
+        return changed
+
+    monkeypatch.setattr("paperclean.pipeline.repair_region", repair)
+
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        FakeClient(),
+        force=False,
+    )  # type: ignore[arg-type]
+
+    assert consensus_flags == [False, True, True]
+    assert len(repair_contexts) == 1
+    assert repair_contexts[0][3] - repair_contexts[0][1] == pytest.approx(0.12)
+    attempt = report.pages[0].attempts[0]
+    assert attempt.localized_quality_regions == repair_paste_regions
+    assert attempt.committed_quality_regions == repair_paste_regions
+    assert attempt.rejected_quality_regions == []
+    assert report.pages[0].status == "model_assisted_clean"
+
+
+def test_source_cleanup_consumes_new_final_consensus_regions_within_global_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.residual_punch_hole_regions",
+        lambda *_args: [],
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.authored_punch_hole_regions",
+        lambda _source: [],
+    )
+    first_fold = Discrepancy("scanner_quality", "medium", (0.01, 0.33, 0.98, 0.35))
+    second_fold = Discrepancy("scanner_quality", "medium", (0.01, 0.67, 0.98, 0.69))
+    verification_results = iter(
+        [
+            (False, [first_fold]),
+            (False, [first_fold, second_fold]),
+            (True, []),
+        ]
+    )
+    consensus_flags: list[bool] = []
+
+    def verify(*_args, **kwargs):
+        consensus_flags.append(kwargs["quality_consensus"])
+        return next(verification_results)
+
+    monkeypatch.setattr("paperclean.pipeline._verification_accepts", verify)
+    monkeypatch.setattr(
+        "paperclean.pipeline._incremental_content_accepts",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.erase_contained_edge_artifacts",
+        lambda candidate, _region: candidate,
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.erase_localized_pale_artifacts",
+        lambda candidate, _region: candidate,
+    )
+    repair_paste_regions: list[tuple[float, float, float, float]] = []
+
+    def repair(_repair_source, candidate, _context, *_args, **kwargs):
+        repair_paste_regions.append(kwargs["paste_region"])
+        changed = candidate.copy()
+        changed.putpixel((len(repair_paste_regions), 0), (250, 250, 250))
+        return changed
+
+    monkeypatch.setattr("paperclean.pipeline.repair_region", repair)
+
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        FakeClient(),
+        force=False,
+    )  # type: ignore[arg-type]
+
+    assert consensus_flags == [False, True, True]
+    assert len(repair_paste_regions) == 2
+    attempt = report.pages[0].attempts[0]
+    assert attempt.localized_quality_regions == repair_paste_regions
+    assert attempt.committed_quality_regions == repair_paste_regions
+    assert report.pages[0].status == "model_assisted_clean"
+
+
 def test_source_cleanup_isolates_multiple_quality_repairs(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "scan.png"
     _write_png(source)
@@ -1627,13 +2022,21 @@ def test_broad_quality_discrepancy_never_becomes_a_regional_recreation() -> None
     assert region is None
 
 
+def test_large_two_dimensional_quality_box_never_becomes_a_regional_recreation() -> None:
+    region = _localized_quality_repair_region(
+        [Discrepancy("scanner_quality", "medium", (0.0, 0.0, 0.38, 0.34))]
+    )
+
+    assert region is None
+
+
 def test_thin_quality_strip_remains_eligible_for_bounded_repair() -> None:
     region = _localized_quality_repair_region(
         [Discrepancy("scanner_quality", "medium", (0.01, 0.335, 0.545, 0.352))]
     )
 
     assert region is not None
-    assert region[2] - region[0] > 0.55
+    assert region[2] - region[0] >= 0.55
     assert region[3] - region[1] < 0.08
 
 
@@ -1712,6 +2115,222 @@ def test_source_cleanup_prefers_contained_edge_erase_before_model_repair(
     assert len(erase_regions) == 1
     assert report.pages[0].status == "model_assisted_clean"
     assert report.pages[0].attempts[0].accepted is True
+
+
+def test_source_cleanup_tries_model_when_deterministic_quality_repair_stays_dirty(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr("paperclean.pipeline.residual_punch_hole_regions", lambda *_args: [])
+    monkeypatch.setattr("paperclean.pipeline.authored_punch_hole_regions", lambda _source: [])
+    monkeypatch.setattr("paperclean.pipeline.localized_pale_artifact_regions", lambda *_a, **_k: [])
+    verification_results = iter(
+        [
+            (False, [Discrepancy("scanner_quality", "medium", (0.0, 0.1, 0.04, 0.15))]),
+            (True, []),
+        ]
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline._verification_accepts",
+        lambda *_args, **_kwargs: next(verification_results),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline._incremental_content_accepts",
+        lambda *_args, **_kwargs: True,
+    )
+
+    def erase(candidate: Image.Image, _region: tuple[float, float, float, float]) -> Image.Image:
+        changed = candidate.copy()
+        changed.putpixel((0, 0), (254, 254, 254))
+        return changed
+
+    monkeypatch.setattr("paperclean.pipeline.erase_contained_edge_artifacts", erase)
+    model_repairs: list[tuple[float, float, float, float]] = []
+
+    def repair(
+        _source: Image.Image,
+        candidate: Image.Image,
+        _context: tuple[float, float, float, float],
+        **kwargs,
+    ) -> Image.Image:
+        model_repairs.append(kwargs["paste_region"])
+        changed = candidate.copy()
+        changed.putpixel((1, 0), (253, 253, 253))
+        return changed
+
+    monkeypatch.setattr("paperclean.pipeline.repair_region", repair)
+
+    class LocallyVerifiedClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.quality_calls = 0
+
+        def review_quality(self, _candidate: Image.Image, *, view_name: str) -> ReviewVerdict:
+            self.quality_calls += 1
+            if view_name == "full page":
+                return ReviewVerdict(
+                    content_match=True,
+                    scanner_quality=False,
+                    discrepancies=[
+                        Discrepancy("scanner_quality", "medium", (0.0, 0.1, 0.04, 0.15))
+                    ],
+                )
+            assert view_name == "region 1 of 1"
+            if self.quality_calls <= 6:
+                return ReviewVerdict(content_match=True, scanner_quality=False)
+            return ReviewVerdict(content_match=True, scanner_quality=True)
+
+    client = LocallyVerifiedClient()
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        client,
+        force=False,
+    )  # type: ignore[arg-type]
+
+    attempt = report.pages[0].attempts[0]
+    assert model_repairs == attempt.committed_quality_regions
+    assert attempt.rejected_quality_regions == []
+    assert report.pages[0].status == "model_assisted_clean"
+    assert client.quality_calls == 7
+
+
+def test_detector_confirmed_fold_clearance_overrides_stale_model_quality_box(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    _write_png(source)
+    fold = (0.0, 0.33, 1.0, 0.35)
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr("paperclean.pipeline.residual_punch_hole_regions", lambda *_args: [])
+    monkeypatch.setattr("paperclean.pipeline.authored_punch_hole_regions", lambda _source: [])
+    verification_results = iter(
+        [
+            (False, [Discrepancy("scanner_quality", "medium", fold)]),
+            (False, [Discrepancy("scanner_quality", "medium", fold)]),
+        ]
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline._verification_accepts",
+        lambda *_args, **_kwargs: next(verification_results),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline._incremental_content_accepts",
+        lambda *_args, **_kwargs: True,
+    )
+
+    def detected(candidate: Image.Image, **_kwargs) -> list[tuple[float, float, float, float]]:
+        return [fold] if candidate.getpixel((150, 200)) == (255, 255, 255) else []
+
+    monkeypatch.setattr("paperclean.pipeline.localized_pale_artifact_regions", detected)
+    monkeypatch.setattr(
+        "paperclean.pipeline.erase_contained_edge_artifacts",
+        lambda candidate, _region: candidate,
+    )
+
+    def erase(candidate: Image.Image, _region: tuple[float, float, float, float]) -> Image.Image:
+        changed = candidate.copy()
+        changed.putpixel((150, 200), (200, 200, 200))
+        return changed
+
+    monkeypatch.setattr("paperclean.pipeline.erase_localized_pale_artifacts", erase)
+    monkeypatch.setattr(
+        "paperclean.pipeline.repair_region",
+        lambda *_args, **_kwargs: pytest.fail("detector-cleared fold should not regenerate"),
+    )
+
+    class StaleFoldQualityClient(FakeClient):
+        def review_quality(self, _candidate: Image.Image, *, view_name: str) -> ReviewVerdict:
+            assert view_name == "full page"
+            return ReviewVerdict(
+                content_match=True,
+                scanner_quality=False,
+                discrepancies=[Discrepancy("scanner_quality", "medium", fold)],
+            )
+
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        StaleFoldQualityClient(),
+        force=False,
+    )  # type: ignore[arg-type]
+
+    attempt = report.pages[0].attempts[0]
+    assert attempt.committed_quality_regions == [fold]
+    assert attempt.rejected_quality_regions == []
+    assert attempt.verification_discrepancies == []
+    assert report.pages[0].status == "model_assisted_clean"
+
+
+def test_objectively_blank_margin_overrides_stale_model_quality_box(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.png"
+    image = Image.new("RGB", (300, 400), "white")
+    for x in (3, 4):
+        for y in (52, 53):
+            image.putpixel((x, y), (40, 40, 40))
+    image.save(source)
+    raw_region = (0.01, 0.12, 0.015, 0.14)
+    monkeypatch.setattr(
+        "paperclean.pipeline.source_preserving_cleanup", lambda source: source.copy()
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.validate_candidate",
+        lambda *_args, **_kwargs: DeterministicResult(True, []),
+    )
+    monkeypatch.setattr("paperclean.pipeline.residual_punch_hole_regions", lambda *_args: [])
+    monkeypatch.setattr("paperclean.pipeline.authored_punch_hole_regions", lambda _source: [])
+    monkeypatch.setattr("paperclean.pipeline.localized_pale_artifact_regions", lambda *_a, **_k: [])
+    verification_results = iter(
+        [
+            (False, [Discrepancy("scanner_quality", "low", raw_region)]),
+            (False, [Discrepancy("scanner_quality", "low", raw_region)]),
+        ]
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline._verification_accepts",
+        lambda *_args, **_kwargs: next(verification_results),
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline._incremental_content_accepts",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        "paperclean.pipeline.repair_region",
+        lambda *_args, **_kwargs: pytest.fail("blanked margin should not regenerate"),
+    )
+
+    class StaleMarginQualityClient(FakeClient):
+        def review_quality(self, _candidate: Image.Image, *, view_name: str) -> ReviewVerdict:
+            assert view_name == "full page"
+            return ReviewVerdict(
+                content_match=True,
+                scanner_quality=False,
+                discrepancies=[Discrepancy("scanner_quality", "low", raw_region)],
+            )
+
+    report = clean_image(
+        output_paths(source),
+        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        StaleMarginQualityClient(),
+        force=False,
+    )  # type: ignore[arg-type]
+
+    attempt = report.pages[0].attempts[0]
+    assert len(attempt.committed_quality_regions) == 1
+    assert attempt.committed_quality_regions[0] == pytest.approx((0.0, 0.11, 0.02, 0.15))
+    assert attempt.rejected_quality_regions == []
+    assert attempt.verification_discrepancies == []
+    assert report.pages[0].status == "model_assisted_clean"
 
 
 def test_source_cleanup_requires_quality_consensus_before_regeneration(

@@ -35,6 +35,7 @@ from paperclean.preflight import (
     parse_unit_prices,
 )
 from paperclean.prompting import (
+    CANDIDATE_QUALITY_PROMPT,
     ORIENTATION_PROMPT,
     PAGE_LOCATION_PROMPT,
     REVIEW_PROMPT,
@@ -644,6 +645,58 @@ class OpenRouterClient:
             raise
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ReviewerResponseError("the reviewer returned invalid structured output") from exc
+
+    def review_quality(self, candidate: Image.Image, *, view_name: str) -> ReviewVerdict:
+        endpoint = self._required_endpoint(self.review_endpoint, "preflight review endpoint")
+        prompt = CANDIDATE_QUALITY_PROMPT.replace("{view_name}", view_name)
+        body: dict[str, Any] = {
+            "model": endpoint.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": REVIEW_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "text", "text": "CANDIDATE:"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url(candidate, max_edge=2048)},
+                        },
+                    ],
+                },
+            ],
+            "response_format": {"type": "json_schema", "json_schema": REVIEW_SCHEMA},
+            "provider": {"only": [endpoint.provider_slug], "require_parameters": True},
+        }
+        if "reasoning_effort" in endpoint.supported_parameters:
+            body["reasoning_effort"] = "medium"
+        if "max_completion_tokens" in endpoint.supported_parameters:
+            body["max_completion_tokens"] = REVIEW_MAX_COMPLETION_TOKENS
+        else:
+            body["max_tokens"] = REVIEW_MAX_COMPLETION_TOKENS
+        response = self._request("POST", "/chat/completions", json_body=body, paid=True)
+        usage = self.costs.record(
+            response.get("usage") if isinstance(response.get("usage"), dict) else None
+        )
+        try:
+            message = response["choices"][0]["message"]
+            if message.get("refusal"):
+                raise ReviewerResponseError("the reviewer refused the quality check")
+            content = message["content"]
+            value = json.loads(content) if isinstance(content, str) else content
+            verdict = _parse_verdict(value, usage)
+        except ReviewerResponseError:
+            raise
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReviewerResponseError("the quality reviewer returned invalid output") from exc
+        if not verdict.content_match or any(
+            item.category != "scanner_quality" for item in verdict.discrepancies
+        ):
+            raise ReviewerResponseError("the quality reviewer violated its contract")
+        return verdict
 
     def reading_rotation(self, source: Image.Image) -> int:
         endpoint = self._required_endpoint(self.review_endpoint, "preflight review endpoint")
