@@ -29,9 +29,7 @@ def validate_notes(notes: str) -> str:
     return notes.strip() + "\n"
 
 
-def generate_notes(
-    root: Path, version: str, *, ref: str = "HEAD", tag_prefix: str = "v"
-) -> str:
+def generate_notes(root: Path, version: str, *, ref: str = "HEAD", tag_prefix: str = "v") -> str:
     if capture(root, "rev-parse", "--is-shallow-repository") == "true":
         raise ValueError("release notes require full Git history and release tags")
     commit = capture(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
@@ -55,17 +53,12 @@ def generate_notes(
         dict.fromkeys(
             subject.strip()
             for subject in subjects
-            if subject.strip()
-            and not subject.startswith(("Release ", "Bump version to "))
+            if subject.strip() and not subject.startswith(("Release ", "Bump version to "))
         )
     )
     if not changes:
-        raise ValueError(
-            "no releasable commits found; supply reviewed notes with --notes-file"
-        )
-    return validate_notes(
-        "## Changes\n\n" + "\n".join(f"- {subject}" for subject in changes)
-    )
+        raise ValueError("no releasable commits found; supply reviewed notes with --notes-file")
+    return validate_notes("## Changes\n\n" + "\n".join(f"- {subject}" for subject in changes))
 
 
 def main(argv: list[str] | None = None) -> None:
