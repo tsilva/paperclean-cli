@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import tomllib
@@ -22,7 +23,12 @@ TAG_PREFIX = f"{DISTRIBUTION}-v"
 
 def run(args: list[str]) -> None:
     print("+", " ".join(args))
-    subprocess.run(args, cwd=ROOT, check=True)
+    subprocess.run(
+        args,
+        cwd=ROOT,
+        check=True,
+        env={**os.environ, "UV_CONFIG_FILE": str(ROOT / "uv-tool.toml")},
+    )
 
 
 def capture(args: list[str]) -> str:
