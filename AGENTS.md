@@ -10,7 +10,7 @@
 ## Releases
 
 Use the repository-level `$build-release` skill in `.codex/skills/build-release`
-for local release candidates, versioning, tagging, PyPI Trusted Publishing,
+for Actions release candidates, local metadata-only versioning/tagging, PyPI Trusted Publishing,
 GitHub Release creation, monitoring, and exact-version verification. Never
 upload to PyPI manually or put PyPI credentials on a command line.
 

@@ -5,11 +5,19 @@ description: Build, tag, publish, monitor, or verify a PaperClean PyPI release. 
 
 # Build Release
 
-Use PaperClean's repository-owned release script and monitor the exact tag until
-the matching files are visible on PyPI. Never manually upload a distribution,
-print a credential, or put a PyPI token on a command line. Publication uses
-GitHub Actions and PyPI Trusted Publishing through the protected `pypi`
-environment.
+Read and apply the shared `$release-workflow` skill at
+`/Users/tsilva/.codex/skills/release-workflow/SKILL.md` before execution.
+It owns common preflight, publication safeguards, `$push` integration,
+workflow monitoring, verification, and reporting. The rules below are this
+project's adapter; they retain its invocation default and required gates.
+If the shared skill is unavailable, stop and report the missing dependency.
+
+A bare `$build-release` or `/build-release` invocation requests the full
+publication flow. Explicitly local, dry-run, or inspection requests must not
+launch `scripts/release.py`, which commits, tags, and pushes.
+
+Use PaperClean's repository-owned release script. Publication uses GitHub
+Actions and PyPI Trusted Publishing through the protected `pypi` environment.
 
 ## Release flow
 
@@ -23,54 +31,47 @@ git log --oneline @{u}..HEAD
 Stop if the tree is dirty or the branch is unsynchronized. Do not clean, commit,
 pull, switch branches, or discard changes on the user's behalf.
 
-2. Prepare the frozen environment and launch the local release gate:
+2. Launch the metadata-only release operator:
 
 ```bash
-uv sync --frozen --all-groups
-scripts/release.py
+python3 scripts/release.py
 ```
 
 For an explicitly requested version:
 
 ```bash
-scripts/release.py --to <MAJOR.MINOR.PATCH>
+python3 scripts/release.py --to <MAJOR.MINOR.PATCH>
 ```
 
-The script requires an unused PyPI version and tag, promotes the Unreleased
-changelog, locks dependencies, runs formatting/lint/type/tests, builds exactly
-one universal wheel and one sdist, audits both, commits the release metadata,
-creates `paperclean-cli-v<version>`, and atomically pushes the current branch and
-tag. The artifact audit also installs the wheel in an isolated environment from
-the committed lock and invokes its CLI. Report the exact failed gate and stop
-if any step fails.
+The operator checks an unused version and tag, updates version/lock metadata,
+commits that metadata, and atomically pushes synchronized main and the release
+tag. It does not install dependencies, run source tests, or build artifacts.
+GitHub Actions runs all formatting, lint, type, test, packaging, artifact-audit,
+and isolated installed-wheel CLI gates before Trusted Publishing.
 
-3. Resolve the release commit and monitor only the matching workflow:
+For validation without publication, run:
 
 ```bash
-release_sha="$(git rev-list -n 1 paperclean-cli-v<version>)"
-gh run list --workflow release.yml --commit "$release_sha" --limit 5 \
-  --json databaseId,status,conclusion,event,headSha,url
-gh run watch <run-id> --exit-status
+python3 scripts/release.py --validate
 ```
 
-A `workflow_dispatch` run audits but never publishes. If the tag run fails,
-inspect `gh run view <run-id> --log-failed`; do not improvise a manual upload.
+This dispatches the exact pushed main SHA, including when local unrelated work
+is dirty. Monitor that SHA and download/audit its two distribution artifacts.
+No version bump, tag, or publication occurs. Explicit local artifact inspection
+can use the existing helpers, but normal release and validation builds run only
+in Actions.
 
-4. Poll the exact version until PyPI reports both distributions:
+3. Follow the shared monitoring and verification procedure for the `release.yml`
+tag-push run at the full `paperclean-cli-v<version>` commit SHA. A `workflow_dispatch` run
+validates artifacts but never publishes. Verify PyPI project `paperclean-cli` and
+the GitHub Release for the same tag.
+
+Use the existing exact-version verifier:
 
 ```bash
 python .codex/skills/build-release/scripts/release_build.py \
   wait-pypi --version <version>
 ```
 
-For post-publication verification, query
-`https://pypi.org/pypi/paperclean-cli/<version>/json` until the release contains
-`paperclean_cli-<version>-py3-none-any.whl` and
-`paperclean_cli-<version>.tar.gz`. Also verify the GitHub Release exists for the
-same tag.
-
-## Completion
-
-Lead with `https://pypi.org/project/paperclean-cli/<version>/`. Include the exact
-tag, workflow URL and conclusion, GitHub Release URL, and both distribution
-filenames. Do not report success before PyPI returns the files.
+Require `paperclean_cli-<version>-py3-none-any.whl` and
+`paperclean_cli-<version>.tar.gz` on PyPI and the GitHub Release for the tag.

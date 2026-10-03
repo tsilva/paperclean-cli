@@ -9,12 +9,10 @@ import subprocess
 import tomllib
 import urllib.error
 import urllib.request
-from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = ROOT / "pyproject.toml"
-CHANGELOG = ROOT / "CHANGELOG.md"
 HELPER = ROOT / ".codex/skills/build-release/scripts/release_build.py"
 VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 DISTRIBUTION = "paperclean-cli"
@@ -103,6 +101,8 @@ def ensure_clean_and_synced() -> tuple[str, str]:
         raise SystemExit(
             f"current branch must be synced with {upstream}; ahead={ahead} behind={behind}"
         )
+    if branch != "main" or capture(["git", "branch", "--show-current"]) != "main":
+        raise SystemExit("publication requires synchronized main")
     return remote, branch
 
 
@@ -117,69 +117,45 @@ def update_release_files(version: str) -> None:
     if count != 1:
         raise SystemExit("could not update pyproject version")
     PYPROJECT.write_text(pyproject, encoding="utf-8")
-    changelog = CHANGELOG.read_text(encoding="utf-8")
-    marker = "## Unreleased\n"
-    if marker not in changelog:
-        raise SystemExit("CHANGELOG.md must contain an Unreleased section")
-    release_heading = re.compile(rf"(?m)^## {re.escape(version)} - \d{{4}}-\d{{2}}-\d{{2}}$")
-    if release_heading.search(changelog) is None:
-        changelog = changelog.replace(
-            marker,
-            f"## Unreleased\n\n## {version} - {date.today().isoformat()}\n",
-            1,
-        )
-        CHANGELOG.write_text(changelog, encoding="utf-8")
 
 
 def checks() -> None:
-    commands = [
-        ["uv", "lock"],
-        ["uv", "lock", "--check"],
-        ["uv", "sync", "--frozen", "--all-groups"],
-        ["uv", "run", "ruff", "format", "--check", "."],
-        ["uv", "run", "ruff", "check", "."],
-        ["uv", "run", "mypy", "-p", "paperclean"],
-        ["uv", "run", "pytest"],
-        ["uv", "build", "--clear", "--no-sources"],
-    ]
-    for command in commands:
-        run(command)
-    distributions = sorted(
-        str(path.relative_to(ROOT))
-        for pattern in ("*.whl", "*.tar.gz")
-        for path in (ROOT / "dist").glob(pattern)
-    )
-    if len(distributions) != 2:
-        raise SystemExit(f"expected one wheel and one sdist, found {distributions}")
-    run(["uv", "run", "twine", "check", *distributions])
-    run(["uv", "run", "python", str(HELPER), "audit-dist", "--dist-dir", "dist"])
-    wheel = next((ROOT / "dist").glob(f"{ARTIFACT_STEM}-*-py3-none-any.whl"))
-    run(
-        [
-            "uv",
-            "run",
-            "python",
-            str(HELPER),
-            "smoke-wheel",
-            "--wheel",
-            str(wheel.relative_to(ROOT)),
-        ]
-    )
+    # Metadata checks only; source checks and artifact production run in Actions.
+    run(["uv", "lock"])
+    run(["uv", "lock", "--check"])
+    run(["git", "diff", "--check"])
+
+
+def validate() -> None:
+    upstream = capture(["git", "rev-parse", "--abbrev-ref", "@{u}"])
+    remote, _, branch = upstream.partition("/")
+    if branch != "main":
+        raise SystemExit("validation requires an upstream on main")
+    run(["git", "fetch", remote, "main"])
+    sha = capture(["git", "rev-parse", f"{remote}/main"])
+    run(["gh", "workflow", "run", "release.yml", "--ref", "main", "-f", f"ref={sha}"])
+    print(f"validation-sha\t{sha}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--to", help="exact MAJOR.MINOR.PATCH version")
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="build the pushed main commit in Actions without publication",
+    )
     args = parser.parse_args()
+    if args.validate:
+        if args.to:
+            parser.error("--validate cannot be combined with --to")
+        validate()
+        return
     remote, branch = ensure_clean_and_synced()
     version = select_version(args.to)
-    if version != current_version():
-        update_release_files(version)
-    else:
-        # Even an already-pending version must gain a dated release heading.
-        update_release_files(version)
+    update_release_files(version)
     checks()
-    run(["git", "add", "pyproject.toml", "uv.lock", "CHANGELOG.md"])
+    run(["git", "add", "pyproject.toml", "uv.lock"])
     if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=ROOT).returncode != 0:
         run(["git", "commit", "-m", f"Release {DISTRIBUTION} {version}"])
     else:
