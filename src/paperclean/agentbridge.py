@@ -251,7 +251,9 @@ class AgentBridgeClient:
                     "type": "json_schema",
                     "json_schema": PAGE_LOCATION_SCHEMA,
                 },
-                "reasoning_effort": "medium",
+                "reasoning_effort": (
+                    "low" if self.settings.review_model == "codex/gpt-6-astra" else "medium"
+                ),
                 "max_tokens": 1024,
                 "store": False,
             },
@@ -351,7 +353,9 @@ class AgentBridgeClient:
                     "type": "json_schema",
                     "json_schema": ORIENTATION_SCHEMA,
                 },
-                "reasoning_effort": "medium",
+                "reasoning_effort": (
+                    "low" if self.settings.review_model == "codex/gpt-6-astra" else "medium"
+                ),
                 "max_tokens": 512,
                 "store": False,
             },
@@ -403,7 +407,9 @@ class AgentBridgeClient:
                     },
                 ],
                 "response_format": {"type": "json_schema", "json_schema": REVIEW_SCHEMA},
-                "reasoning_effort": "medium",
+                "reasoning_effort": (
+                    "low" if self.settings.review_model == "codex/gpt-6-astra" else "medium"
+                ),
                 "max_tokens": 2048,
                 "store": False,
             },
@@ -446,7 +452,9 @@ class AgentBridgeClient:
                     },
                 ],
                 "response_format": {"type": "json_schema", "json_schema": REVIEW_SCHEMA},
-                "reasoning_effort": "medium",
+                "reasoning_effort": (
+                    "low" if self.settings.review_model == "codex/gpt-6-astra" else "medium"
+                ),
                 "max_tokens": 2048,
                 "store": False,
             },

@@ -582,6 +582,15 @@ def test_source_cleanup_preserves_pale_chromatic_logo_while_whitening_paper() ->
     assert cleaned.getpixel((400, 300)) == (255, 255, 255)
 
 
+def test_source_cleanup_does_not_restore_small_pale_warm_foxing_as_colored_ink() -> None:
+    source = Image.new("RGB", (800, 1000), (240, 230, 215))
+    ImageDraw.Draw(source).ellipse((500, 500, 510, 512), fill=(244, 225, 202))
+
+    cleaned = source_preserving_cleanup(source)
+
+    assert cleaned.getpixel((505, 506)) == (255, 255, 255)
+
+
 def test_source_cleanup_removes_boundary_rail_without_following_noise_into_photo() -> None:
     pixels = np.full((1000, 800, 3), 235, dtype=np.uint8)
     pixels[:, :5] = 0
@@ -703,6 +712,35 @@ def test_short_glyph_extension_inside_hole_padding_requires_assisted_repair() ->
     candidates = _punch_hole_candidates(pixels)
 
     assert any(touches_authored_ink for *_geometry, touches_authored_ink in candidates)
+
+
+def test_irregular_blank_punch_is_not_mistaken_for_a_directional_glyph() -> None:
+    pixels = np.full((800, 600, 3), 238, dtype=np.uint8)
+    cv2.ellipse(pixels, (35, 300), (25, 18), 0, 0, 360, (0, 0, 0), thickness=-1)
+
+    candidates = _punch_hole_candidates(pixels)
+
+    assert candidates
+    assert all(not touches_authored_ink for *_geometry, touches_authored_ink in candidates)
+
+
+def test_punch_touching_photo_component_does_not_trigger_text_reconstruction(
+    monkeypatch,
+) -> None:
+    pixels = np.full((1000, 800, 3), 238, dtype=np.uint8)
+    cv2.circle(pixels, (45, 300), 22, (0, 0, 0), thickness=-1)
+    cv2.rectangle(pixels, (65, 220), (720, 620), (35, 35, 35), thickness=-1)
+    photographic = np.zeros((1000, 800), dtype=np.uint8)
+    photographic[220:621, 65:721] = 255
+    monkeypatch.setattr(
+        "paperclean.restoration._photographic_region_mask",
+        lambda _pixels: photographic,
+    )
+
+    candidates = _punch_hole_candidates(pixels)
+
+    assert candidates
+    assert all(not touches_authored_ink for *_geometry, touches_authored_ink in candidates)
 
 
 def test_source_cleanup_removes_a_blank_punch_hole_near_ten_percent_margin() -> None:

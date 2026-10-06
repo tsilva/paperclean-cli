@@ -23,3 +23,10 @@ Before every task in this repository, use the `$specs-author` skill to read the 
 - If the task, repository, or user request contradicts, omits, or ambiguously interprets the specification, tell the user. Continue safe exploration and work that does not depend on resolving the issue, but never silently choose an interpretation.
 - Never edit `SPECS.md` from inference. Propose the exact change, explain why it reflects stakeholder intent, and edit the file only after the user explicitly approves that exact change.
 - Keep `SPECS.md` complete, concise, and compacted. It must contain stakeholder intent rather than implementation, architecture, operations, or transient project detail.
+
+## Shared release procedure
+
+The project `build-release` skill composes `$release-workflow` from
+`/Users/tsilva/.codex/skills/release-workflow/SKILL.md`.
+Read both for release work; keep project commands, version policy, artifact
+requirements, and approval gates in the project adapter.

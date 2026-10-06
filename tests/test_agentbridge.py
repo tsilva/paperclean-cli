@@ -48,9 +48,12 @@ def test_agentbridge_client_runs_preflight_generation_and_structured_review() ->
         if path == "/api/v1/models":
             return httpx.Response(
                 200,
-                json={"data": [{"id": "codex/gpt-5.6-sol", "object": "model"}]},
+                json={"data": [{"id": "codex/gpt-6-astra", "object": "model"}]},
             )
         body = json.loads(request.content)
+        assert body["model"] == "codex/gpt-6-astra"
+        if path == "/api/v1/chat/completions":
+            assert body["reasoning_effort"] == "low"
         calls.append((path, body))
         if path == "/api/v1/images":
             return httpx.Response(

@@ -676,9 +676,23 @@ def _authored_chromatic_mask(pixels: np.ndarray) -> np.ndarray:
     if count <= 1:
         return np.zeros((height, width), dtype=np.uint8)
     seed_counts = np.bincount(labels.ravel(), weights=seeds.ravel(), minlength=count)
+    flattened_labels = labels.astype(np.intp, copy=False).ravel()
+    minimum_gray = np.full(count, 255, dtype=np.uint8)
+    np.minimum.at(minimum_gray, flattened_labels, gray.ravel())
+    maximum_chroma = np.zeros(count, dtype=np.int16)
+    np.maximum.at(maximum_chroma, flattened_labels, chroma.ravel())
     short_edge = min(height, width)
     minimum_area = max(12, round(short_edge * short_edge * 0.000003))
-    retained = (stats[:, cv2.CC_STAT_AREA] >= minimum_area) & (seed_counts >= 8)
+    substantial_area = max(minimum_area, round(height * width * 0.00020))
+    retained = (
+        (stats[:, cv2.CC_STAT_AREA] >= minimum_area)
+        & (seed_counts >= 8)
+        & (
+            (stats[:, cv2.CC_STAT_AREA] >= substantial_area)
+            | (minimum_gray < 180)
+            | (maximum_chroma >= 70)
+        )
+    )
     retained[0] = False
     mask = retained[labels].astype(np.uint8) * 255
     expansion = max(1, round(short_edge * 0.0007))
@@ -1126,6 +1140,13 @@ def _punch_hole_candidates(
             outside_core = component & (core_disk == 0)
             outside_core_fraction = int(np.count_nonzero(outside_core)) / area
             if int(nearby_label) == hole_label and outside_core_fraction > 0.08:
+                component_photo_fraction = float(np.mean(photographic_mask[component] > 0))
+                if component_photo_fraction >= 0.50:
+                    # A side-margin punch can touch the bounding component of a
+                    # nearby radiograph or ultrasound panel without obscuring a
+                    # glyph. The panel itself is already preserved independently;
+                    # do not route a blank paper hole through text reconstruction.
+                    continue
                 outside_y, outside_x = np.where(outside_core)
                 distances = np.hypot(outside_x - center_x, outside_y - center_y)
                 direction_strength = float(
@@ -1134,7 +1155,7 @@ def _punch_hole_candidates(
                         np.mean((outside_y - center_y) / np.maximum(distances, 1)),
                     )
                 )
-                if direction_strength > 0.45:
+                if direction_strength > 0.75:
                     # A glyph or rule can merge into the punch yet remain wholly
                     # inside the erasure padding. Its directional protrusion is
                     # authored evidence; symmetric rasterization around a round

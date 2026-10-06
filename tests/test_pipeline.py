@@ -24,6 +24,7 @@ from paperclean.pipeline import (
     _nonactionable_low_quality_only,
     _quality_repair_accepts,
     _validate_clean_candidate,
+    _verification_accepts,
     clean_image,
     report_has_fallback,
     report_summary,
@@ -249,6 +250,37 @@ def test_source_cleanup_uses_candidate_only_gate_for_quality_only_comparison(
     assert report.pages[0].status == "source_preserving_clean"
     assert report.pages[0].attempts[-1].verification_categories == []
     assert client.quality_calls == 5
+
+
+def test_mixed_tolerated_layout_and_quality_verdict_returns_only_quality_blocker() -> None:
+    image = Image.new("RGB", (300, 400), "white")
+
+    class MixedVerdictClient(FakeClient):
+        def review(
+            self, _source: Image.Image, _candidate: Image.Image, *, view_name: str
+        ) -> ReviewVerdict:
+            self.review_calls += 1
+            return ReviewVerdict(
+                content_match=False,
+                scanner_quality=False,
+                discrepancies=[
+                    Discrepancy("changed_layout", "medium", (0.1, 0.1, 0.2, 0.2)),
+                    Discrepancy("scanner_quality", "medium", (0.7, 0.7, 0.8, 0.8)),
+                ],
+            )
+
+    client = MixedVerdictClient()
+    accepted, discrepancies = _verification_accepts(
+        client,
+        image,
+        image.copy(),
+        tolerated_categories=frozenset({"changed_layout"}),
+        confirm_rejections=True,
+    )
+
+    assert accepted is False
+    assert [item.category for item in discrepancies] == ["scanner_quality"]
+    assert client.review_calls == 2
 
 
 def test_source_cleanup_records_broad_low_quality_warning_without_fallback(
@@ -791,8 +823,8 @@ def test_clean_image_records_agentbridge_subscription_provenance(
         api_key="",
         backend="agentbridge",
         base_url="http://127.0.0.1:8082/api/v1",
-        image_model="codex/gpt-5.6-sol",
-        review_model="codex/gpt-5.6-sol",
+        image_model="codex/gpt-6-astra",
+        review_model="codex/gpt-6-astra",
     )
 
     report = clean_image(paths, settings, client, force=False)  # type: ignore[arg-type]
@@ -834,8 +866,8 @@ def test_agentbridge_ordinary_scan_verifies_source_cleanup_before_generation(
         api_key="",
         backend="agentbridge",
         base_url="http://127.0.0.1:8082/api/v1",
-        image_model="codex/gpt-5.6-sol",
-        review_model="codex/gpt-5.6-sol",
+        image_model="codex/gpt-6-astra",
+        review_model="codex/gpt-6-astra",
     )
 
     report = clean_image(output_paths(source), settings, client, force=False)  # type: ignore[arg-type]
@@ -888,8 +920,8 @@ def test_agentbridge_repairs_authored_hole_before_full_page_generation(
         api_key="",
         backend="agentbridge",
         base_url="http://127.0.0.1:8082/api/v1",
-        image_model="codex/gpt-5.6-sol",
-        review_model="codex/gpt-5.6-sol",
+        image_model="codex/gpt-6-astra",
+        review_model="codex/gpt-6-astra",
     )
     report = clean_image(
         output_paths(source),
@@ -935,8 +967,8 @@ def test_high_confidence_reading_rotation_precedes_cleanup_and_review(
         api_key="",
         backend="agentbridge",
         base_url="http://127.0.0.1:8082/api/v1",
-        image_model="codex/gpt-5.6-sol",
-        review_model="codex/gpt-5.6-sol",
+        image_model="codex/gpt-6-astra",
+        review_model="codex/gpt-6-astra",
     )
     report = clean_image(
         output_paths(source),
@@ -2530,7 +2562,9 @@ def test_source_cleanup_confirms_transient_content_rejection(tmp_path: Path, mon
     assert report.pages[0].attempts[-1].accepted is True
 
 
-def test_source_cleanup_records_each_boolean_only_rejection(tmp_path: Path, monkeypatch) -> None:
+def test_source_cleanup_separates_tolerated_layout_from_boolean_quality_alerts(
+    tmp_path: Path, monkeypatch
+) -> None:
     source = tmp_path / "scan.png"
     _write_png(source)
     monkeypatch.setattr(
@@ -2564,14 +2598,11 @@ def test_source_cleanup_records_each_boolean_only_rejection(tmp_path: Path, monk
         force=False,
     )  # type: ignore[arg-type]
 
-    # The initial all-view localization records quality boxes without repeating
-    # consensus; only the final acceptance pass uses quality consensus.
-    assert client.review_calls == 8
-    assert report.pages[0].status == "original_fallback"
-    assert report.pages[0].attempts[-1].verification_categories == [
-        "changed_layout",
-        "scanner_quality",
-    ]
+    # Tolerated layout normalization no longer prevents the remaining boolean-only
+    # quality alerts from receiving their independent consensus pass.
+    assert client.review_calls == 13
+    assert report.pages[0].status == "source_preserving_clean"
+    assert report.pages[0].attempts[-1].verification_categories == []
 
 
 def test_source_cleanup_restores_flagged_source_evidence_and_rechecks(

@@ -322,6 +322,7 @@ def _verification_accepts(
     collect_all_views: bool = False,
 ) -> tuple[bool, list[Discrepancy]]:
     discrepancies: list[Discrepancy] = []
+    tolerated_discrepancies: list[Discrepancy] = []
     rejected = False
     view_pairs = (
         registered_review_pairs(source, candidate)
@@ -390,6 +391,26 @@ def _verification_accepts(
             item.category == "scanner_quality" for item in view_discrepancies
         ):
             view_discrepancies.append(Discrepancy("scanner_quality", "high", (0.0, 0.0, 1.0, 1.0)))
+        # A mixed verdict must not let an explicitly tolerated transformation
+        # poison an otherwise quality-only decision. Preserve tolerated alerts in
+        # accepted-page provenance, but arbitrate only the remaining actionable
+        # categories. This is especially important after de-skewing, punch removal,
+        # and perspective normalization, which reviewers may label changed_layout.
+        actionable_view_discrepancies = [
+            item for item in view_discrepancies if item.category not in tolerated_categories
+        ]
+        actionable_view_discrepancies = [
+            item
+            for item in actionable_view_discrepancies
+            if not (
+                item.category == "scanner_quality"
+                and regions_are_preserved_visual_panels(
+                    source_view,
+                    candidate_view,
+                    [item.region],
+                )
+            )
+        ]
         view_box = (
             (0, 0, candidate.width, candidate.height)
             if index == 0
@@ -400,26 +421,27 @@ def _verification_accepts(
         view_height = view_bottom - view_top
         for item in view_discrepancies:
             left, top, right, bottom = item.region
-            discrepancies.append(
-                Discrepancy(
-                    category=item.category,
-                    severity=item.severity,
-                    region=(
-                        (view_left + left * view_width) / candidate.width,
-                        (view_top + top * view_height) / candidate.height,
-                        (view_left + right * view_width) / candidate.width,
-                        (view_top + bottom * view_height) / candidate.height,
-                    ),
-                )
+            mapped = Discrepancy(
+                category=item.category,
+                severity=item.severity,
+                region=(
+                    (view_left + left * view_width) / candidate.width,
+                    (view_top + top * view_height) / candidate.height,
+                    (view_left + right * view_width) / candidate.width,
+                    (view_top + bottom * view_height) / candidate.height,
+                ),
             )
-        tolerated_transformation = bool(verdict.discrepancies) and all(
-            item.category in tolerated_categories for item in verdict.discrepancies
-        )
-        if not verdict.accepted and not tolerated_transformation:
+            if item.category in tolerated_categories:
+                tolerated_discrepancies.append(mapped)
+            elif item in actionable_view_discrepancies:
+                discrepancies.append(mapped)
+        if actionable_view_discrepancies:
             rejected = True
             if not collect_all_views:
                 return False, discrepancies
-    return not rejected, discrepancies
+    if rejected:
+        return False, discrepancies
+    return True, [*discrepancies, *tolerated_discrepancies]
 
 
 def _incremental_content_accepts(
@@ -1070,6 +1092,15 @@ def _try_source_first_cleanup(
             if not has_candidate_quality_reviewer:
                 return accepted, discrepancies
             quality_accepted, quality_discrepancies = _candidate_quality_accepts(client, candidate)
+            quality_discrepancies = [
+                item
+                for item in quality_discrepancies
+                if not regions_are_preserved_visual_panels(
+                    source,
+                    candidate,
+                    [item.region],
+                )
+            ]
             detected = localized_pale_artifact_regions(
                 candidate,
                 limit=_MAX_SCAN_QUALITY_REPAIRS,
