@@ -1,8 +1,10 @@
-<div align="center">
+<p align="center">
   <img src="./logo.png" alt="PaperClean" width="300" />
-
-  **🧹 Turn rough document photos into conservative, scanner-like files. 🧹**
-</div>
+  <br />
+  <!-- repo-tagline:start -->
+  <strong>🧹 Turn rough document photos into conservative, scanner-like files 🧹</strong>
+  <!-- repo-tagline:end -->
+</p>
 
 PaperClean is a Python CLI for people who need cleaner PDFs or images from phone
 photos and poor scans without silently accepting changed content. Give it a PDF,
