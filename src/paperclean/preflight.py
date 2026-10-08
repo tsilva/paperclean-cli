@@ -10,6 +10,7 @@ from paperclean.errors import GlobalOpenRouterError
 
 # PaperClean sends one full-page comparison plus four regional comparisons.
 REVIEW_VIEWS_PER_ATTEMPT = 5
+ORIENTATION_CLASSIFICATIONS_PER_PAGE = 1
 
 # A full-page generation can be retried once with a smaller reference image, and
 # one regional repair generation can follow a failed verification. Each verdict
@@ -114,10 +115,14 @@ def build_subscription_projection(
         image_provider="Codex via AgentBridge",
         review_model=review_model,
         review_provider="Codex via AgentBridge",
-        one_pass=estimate(page_total, page_total * REVIEW_VIEWS_PER_ATTEMPT),
+        one_pass=estimate(
+            page_total,
+            page_total * (REVIEW_VIEWS_PER_ATTEMPT + ORIENTATION_CLASSIFICATIONS_PER_PAGE),
+        ),
         configured_max=estimate(
             configured_pages,
-            configured_pages * REVIEW_VIEWS_PER_ATTEMPT,
+            configured_pages * REVIEW_VIEWS_PER_ATTEMPT
+            + page_total * ORIENTATION_CLASSIFICATIONS_PER_PAGE,
         ),
         recovery_ceiling=estimate(
             configured_pages * GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT
@@ -127,6 +132,7 @@ def build_subscription_projection(
             * (
                 SOURCE_ASSISTED_REVIEW_REQUESTS_PER_PAGE
                 + SOURCE_CLEANUP_REVIEW_REQUESTS_PER_PAGE
+                + ORIENTATION_CLASSIFICATIONS_PER_PAGE
             ),
         ),
         account_remaining_usd=None,
@@ -232,10 +238,14 @@ def build_cost_projection(
         image_provider=image_provider,
         review_model=review_model,
         review_provider=review_provider,
-        one_pass=estimate(page_total, page_total * REVIEW_VIEWS_PER_ATTEMPT),
+        one_pass=estimate(
+            page_total,
+            page_total * (REVIEW_VIEWS_PER_ATTEMPT + ORIENTATION_CLASSIFICATIONS_PER_PAGE),
+        ),
         configured_max=estimate(
             configured_pages,
-            configured_pages * REVIEW_VIEWS_PER_ATTEMPT,
+            configured_pages * REVIEW_VIEWS_PER_ATTEMPT
+            + page_total * ORIENTATION_CLASSIFICATIONS_PER_PAGE,
         ),
         recovery_ceiling=estimate(
             configured_pages * GENERATION_REQUESTS_PER_RECOVERY_ATTEMPT
@@ -245,6 +255,7 @@ def build_cost_projection(
             * (
                 SOURCE_ASSISTED_REVIEW_REQUESTS_PER_PAGE
                 + SOURCE_CLEANUP_REVIEW_REQUESTS_PER_PAGE
+                + ORIENTATION_CLASSIFICATIONS_PER_PAGE
             ),
         ),
         account_remaining_usd=account_remaining_usd,

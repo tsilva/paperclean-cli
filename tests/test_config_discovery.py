@@ -43,8 +43,8 @@ def test_agentbridge_settings_need_no_openrouter_key_and_use_codex_defaults() ->
 
     assert settings.api_key == ""
     assert settings.base_url == "http://127.0.0.1:8082/api/v1"
-    assert settings.image_model == "codex/gpt-5.6-sol"
-    assert settings.review_model == "codex/gpt-5.6-sol"
+    assert settings.image_model == "codex/gpt-6-astra"
+    assert settings.review_model == "codex/gpt-6-astra"
     assert settings.agentbridge_timeout == 660
 
 

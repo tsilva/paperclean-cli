@@ -41,9 +41,18 @@ class ModelClient(Protocol):
 
     def locate_page(self, source: Image.Image) -> PageGeometry | None: ...
 
+    def reading_rotation(self, source: Image.Image) -> int: ...
+
     def review(
         self,
         source: Image.Image,
+        candidate: Image.Image,
+        *,
+        view_name: str,
+    ) -> ReviewVerdict: ...
+
+    def review_quality(
+        self,
         candidate: Image.Image,
         *,
         view_name: str,

@@ -1,0 +1,2 @@
+exclude-newer = "7 days"
+constraint-dependencies = ["mistralai!=2.4.6", "guardrails-ai!=0.10.1"]

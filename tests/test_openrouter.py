@@ -101,8 +101,13 @@ def test_preflight_generation_and_review_contract() -> None:
         image = Image.new("RGB", (32, 32), "white")
         assert client.generate(image, "clean", max_edge=4096).size == (32, 32)
         assert client.review(image, image, view_name="full page").accepted
-        assert float(client.costs.total) == pytest.approx(0.03)
-    assert len(requests) == 4
+        assert client.review_quality(image, view_name="full page").accepted
+        assert float(client.costs.total) == pytest.approx(0.05)
+    quality_body = json.loads(requests[-1].content)
+    quality_content = quality_body["messages"][1]["content"]
+    assert sum(item.get("type") == "image_url" for item in quality_content) == 1
+    assert all(item.get("text") != "ORIGINAL:" for item in quality_content)
+    assert len(requests) == 5
 
 
 def test_zdr_rejects_unlisted_pair() -> None:
@@ -273,12 +278,12 @@ def test_cost_projection_uses_selected_endpoint_prices_and_credit_balances() -> 
         projection = client.cost_projection(document_total=1, page_total=1, max_attempts=3)
 
     assert projection.one_pass.generations == 1
-    assert projection.one_pass.reviews == 5
-    assert projection.one_pass.paid_calls == 6
-    assert projection.one_pass.cost_usd == Decimal("1.189452")
-    assert projection.configured_max.cost_usd == Decimal("3.568356")
-    assert projection.recovery_ceiling.paid_calls == 371
-    assert projection.recovery_ceiling.cost_usd == Decimal("64.616772")
+    assert projection.one_pass.reviews == 6
+    assert projection.one_pass.paid_calls == 7
+    assert projection.one_pass.cost_usd == Decimal("1.358412")
+    assert projection.configured_max.cost_usd == Decimal("3.737316")
+    assert projection.recovery_ceiling.paid_calls == 372
+    assert projection.recovery_ceiling.cost_usd == Decimal("64.785732")
     assert projection.account_remaining_usd == Decimal("0.718589992")
     assert projection.key_remaining_usd == Decimal("10")
 

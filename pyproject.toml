@@ -3,8 +3,8 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "paperclean"
-version = "0.1.1"
+name = "paperclean-cli"
+version = "0.1.2"
 description = "Conservatively clean phone-scanned PDF and image documents with image generation and strict review."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,12 +33,13 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/tsilva/paperclean"
-Repository = "https://github.com/tsilva/paperclean"
-Issues = "https://github.com/tsilva/paperclean/issues"
+Homepage = "https://github.com/tsilva/paperclean-cli"
+Repository = "https://github.com/tsilva/paperclean-cli"
+Issues = "https://github.com/tsilva/paperclean-cli/issues"
 
 [project.scripts]
 paperclean = "paperclean.cli:main"
+paperclean-lab = "paperclean.lab:main"
 
 [dependency-groups]
 dev = [
@@ -53,14 +54,13 @@ release = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/paperclean"]
-artifacts = ["src/paperclean/prompts/**/*.md"]
+artifacts = ["src/paperclean/prompts/**/*.md", "src/paperclean/lab_static/*"]
 
 [tool.hatch.build.targets.sdist]
 include = [
   "/src",
   "/tests",
   "/README.md",
-  "/CHANGELOG.md",
   "/pyproject.toml",
 ]
 

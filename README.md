@@ -1,8 +1,10 @@
-<div align="center">
+<p align="center">
   <img src="./logo.png" alt="PaperClean" width="300" />
-
-  **🧹 Turn rough document photos into conservative, scanner-like files. 🧹**
-</div>
+  <br />
+  <!-- repo-tagline:start -->
+  <strong>🧹 Turn rough document photos into conservative, scanner-like files 🧹</strong>
+  <!-- repo-tagline:end -->
+</p>
 
 PaperClean is a Python CLI for people who need cleaner PDFs or images from phone
 photos and poor scans without silently accepting changed content. Give it a PDF,
@@ -23,8 +25,11 @@ PaperClean requires Python 3.11 or newer. Keyenv is recommended on macOS:
 
 ```bash
 uv tool install keyenv-macos
-uv tool install paperclean
+uv tool install paperclean-cli
 ```
+
+The PyPI distribution is named `paperclean-cli`; it installs the `paperclean`
+command and Python package.
 
 Keyenv is the recommended way to keep `OPENROUTER_API_KEY` in the macOS
 Keychain. Create `~/.config/keyenv/.keyenv.toml`:
@@ -63,6 +68,47 @@ uv run agentbridge
 # In another terminal, from the directory containing the document:
 paperclean document.pdf --backend agentbridge --yes
 ```
+
+## Document review workspace
+
+Start AgentBridge, then launch the local workspace:
+
+```bash
+uv run --frozen paperclean-lab --port auto
+# Optionally preload a document:
+uv run --frozen paperclean-lab --port auto --import-document document.pdf
+```
+
+Upload a PDF, PNG, or JPEG, then restore the document. Navigate its pages to
+compare the original and current restoration side by side. Numbered issue markers
+show review descriptions on hover; click a marker for paired crops. **Accept issue**
+includes a finding in the next repair; **Dismiss** marks a false alarm. Add comments
+per finding or page instructions. Feedback saves automatically when leaving a
+field or page, and can also be saved explicitly.
+
+**Refine this page** repairs the selected page; **Refine marked pages** repairs
+reviewed pages with accepted findings or comments. Each refinement uses the
+latest page pixels, original evidence, and a frozen feedback snapshot, then
+receives a new independent review. It creates a new document version while
+retaining unchanged pages. Browse and download previous versions; refine from
+the latest version. You can repeat this process without a fixed iteration limit.
+
+Each generated or repaired page makes one native Codex imagegen request and one
+structured review request to **GPT-6.1 Sol with High reasoning**. AgentBridge accepts
+one image reference for generation, so repairs pack the original and prior
+restoration into one labeled reference. The imagegen orchestrator field chooses
+the Codex model calling the image tool; the underlying image model is not exposed.
+Prompts remain editable. No OpenRouter key is used.
+
+**Download full PDF** is available throughout processing. It includes every page,
+using current candidate pixels, the prior restoration during an unfinished repair,
+and original pixels where no restoration exists. Review markers are excluded.
+Searchable text in source PDFs is preserved and active content is stripped.
+The UI shows processing, failed, and partially restored versions explicitly.
+Downloads are review candidates, not automatically accepted cleaned documents.
+
+Originals, page versions, prompts, reviews, feedback, timing, and observable usage
+persist in `tmp/paperclean-lab/` (ignored by Git); change this with `--data-dir`.
 
 ## Commands
 
@@ -105,7 +151,7 @@ CLI flags override environment variables, which override these defaults:
 | `PAPERCLEAN_ZDR` | `false` |
 
 `OPENROUTER_API_KEY` is required only for the default OpenRouter backend.
-AgentBridge defaults both models to `codex/gpt-5.6-sol`, requires a loopback URL,
+AgentBridge defaults both models to `codex/gpt-6-astra` with low reasoning, requires a loopback URL,
 and does not support `--max-cost-usd` or `--zdr`. PaperClean reads supported
 values from the process environment first, then user-level `.env` or Keyenv
 configuration, then repository-level configuration.
@@ -118,9 +164,9 @@ configuration, then repository-level configuration.
   five-view model verification. Rejected candidates retry with feedback, then fall
   back to a source-preserving white-paper cleanup that must pass the same verification.
   A page-scoped review timeout is retried exactly once before that attempt fails closed.
-  That recovery confirms every rejection once and records residual quality limitations
-  plus expected global deskew/layout rectification in legacy pages. Confirmed non-specific
-  alerts are recorded but do not veto a deterministic candidate. Explicit missing,
+  That recovery confirms every rejection once. Confirmed scanner-quality failures still
+  veto publication; only expected global deskew/layout rectification and conservatively
+  preserved source uncertainty are tolerated. Explicit missing,
   cropped, invented, text, table, and diagram discrepancies still fail closed; localized
   normalized source evidence is restored for text-like discrepancies and the candidate is
   reviewed again. The untouched original page is used only if recovery still fails.

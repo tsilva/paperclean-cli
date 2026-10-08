@@ -75,8 +75,8 @@ def test_codex_subscription_preflight_reports_calls_without_inventing_usd(capsys
         document_total=1,
         page_total=2,
         max_attempts=3,
-        image_model="codex/gpt-5.6-sol",
-        review_model="codex/gpt-5.6-sol",
+        image_model="codex/gpt-6-astra",
+        review_model="codex/gpt-6-astra",
         backend_version="0.1.9",
     )
 
