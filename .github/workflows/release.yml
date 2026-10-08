@@ -155,14 +155,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Verify downloaded-artifact source identity
         env:
           REQUESTED: ${{ inputs.ref }}
+          TRUSTED_SHA: ${{ github.sha }}
           DISPATCH_REF: ${{ github.ref }}
         run: |
           test "$DISPATCH_REF" = refs/heads/main
+          test "$REQUESTED" = "$TRUSTED_SHA"
           [[ "$REQUESTED" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$REQUESTED"
           git merge-base --is-ancestor "$REQUESTED" origin/main
