@@ -216,6 +216,11 @@ uv build --no-sources           # build wheel and source distribution
 keyenv run -- uv run pytest -m live  # run opt-in live tests
 ```
 
+Release workflow validation uses `python3 scripts/release.py --validate` to
+check the exact pushed main commit without publishing. It builds the wheel and
+source distribution, uploads and downloads them, audits their contents, and
+smoke-tests the downloaded wheel in an isolated environment.
+
 ## Architecture
 
 ![PaperClean architecture](./architecture.png)
