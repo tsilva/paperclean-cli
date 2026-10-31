@@ -6,16 +6,16 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Literal, cast
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from paperclean.errors import ConfigurationError
 
-DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_BASE_URL = "http://127.0.0.1:8082/api/v1"
 DEFAULT_IMAGE_MODEL = "openai/gpt-image-2"
 DEFAULT_REVIEW_MODEL = "openai/gpt-5.6-sol"
 DEFAULT_AGENTBRIDGE_BASE_URL = "http://127.0.0.1:8082/api/v1"
-DEFAULT_AGENTBRIDGE_MODEL = "codex/gpt-6-astra"
+DEFAULT_AGENTBRIDGE_MODEL = "codex/gpt-6.1-sol"
 DEFAULT_AGENTBRIDGE_TIMEOUT = 660
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_JOBS = 1
@@ -57,7 +57,7 @@ def _bool(name: str, value: object) -> bool:
 @dataclass(frozen=True, slots=True)
 class Settings:
     api_key: str
-    backend: Literal["openrouter", "agentbridge"] = "openrouter"
+    backend: Literal["agentbridge"] = "agentbridge"
     base_url: str = DEFAULT_BASE_URL
     image_model: str = DEFAULT_IMAGE_MODEL
     review_model: str = DEFAULT_REVIEW_MODEL
@@ -88,40 +88,19 @@ class Settings:
                 return value
             return env.get(env_key, default)
 
-        backend = str(choose("backend", "PAPERCLEAN_BACKEND", "openrouter")).strip().lower()
-        if backend not in {"openrouter", "agentbridge"}:
-            raise ConfigurationError("PAPERCLEAN_BACKEND must be openrouter or agentbridge")
-        api_key = str(choose("api_key", "OPENROUTER_API_KEY", "")).strip()
-        if backend == "openrouter" and not api_key:
-            raise ConfigurationError(
-                "OPENROUTER_API_KEY is required; inject it with `keyenv run -- ...`"
-            )
-        if backend == "agentbridge":
-            base_url = str(
-                choose(
-                    "base_url",
-                    "PAPERCLEAN_AGENTBRIDGE_BASE_URL",
-                    DEFAULT_AGENTBRIDGE_BASE_URL,
-                )
-            ).rstrip("/")
-            url_name = "PAPERCLEAN_AGENTBRIDGE_BASE_URL"
-        else:
-            base_url = str(choose("base_url", "OPENROUTER_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
-            url_name = "OPENROUTER_BASE_URL"
+        api_key = str(choose("api_key", "AGENTBRIDGE_API_KEY", "")).strip()
+        base_url = str(choose("base_url", "AGENTBRIDGE_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
+        url_name = "AGENTBRIDGE_BASE_URL"
         if not base_url.startswith(("https://", "http://")):
             raise ConfigurationError(f"{url_name} must be an HTTP(S) URL")
         parsed_base = urlparse(base_url)
         loopback_hosts = {"localhost", "127.0.0.1", "::1"}
-        if backend == "agentbridge" and parsed_base.hostname not in loopback_hosts:
-            raise ConfigurationError("AgentBridge must use a loopback URL")
+        if not parsed_base.hostname or parsed_base.hostname == "openrouter.ai":
+            raise ConfigurationError("Configure an AgentBridge endpoint")
         if parsed_base.scheme == "http" and parsed_base.hostname not in loopback_hosts:
             raise ConfigurationError(f"{url_name} must use HTTPS unless it targets localhost")
-        default_image_model = (
-            DEFAULT_AGENTBRIDGE_MODEL if backend == "agentbridge" else DEFAULT_IMAGE_MODEL
-        )
-        default_review_model = (
-            DEFAULT_AGENTBRIDGE_MODEL if backend == "agentbridge" else DEFAULT_REVIEW_MODEL
-        )
+        default_image_model = DEFAULT_IMAGE_MODEL
+        default_review_model = DEFAULT_REVIEW_MODEL
         image_model = str(
             choose("image_model", "PAPERCLEAN_IMAGE_MODEL", default_image_model)
         ).strip()
@@ -134,22 +113,23 @@ class Settings:
             )
         if "/" not in image_model or "/" not in review_model:
             raise ConfigurationError("model identifiers must use author/model form")
-        if backend == "agentbridge" and (
-            not image_model.startswith("codex/") or not review_model.startswith("codex/")
-        ):
-            raise ConfigurationError("AgentBridge models must use the codex/ namespace")
+        image_model = gateway_model(image_model)
+        review_model = gateway_model(review_model)
+        native_codex = image_model.startswith("codex/")
+        if native_codex != review_model.startswith("codex/"):
+            raise ConfigurationError("Image and review models must use the same model family")
         max_cost_usd = _optional_money(
             "PAPERCLEAN_MAX_COST_USD",
             choose("max_cost_usd", "PAPERCLEAN_MAX_COST_USD", None),
         )
         zdr = _bool("PAPERCLEAN_ZDR", choose("zdr", "PAPERCLEAN_ZDR", False))
-        if backend == "agentbridge" and max_cost_usd is not None:
-            raise ConfigurationError("--max-cost-usd is unavailable with AgentBridge")
-        if backend == "agentbridge" and zdr:
-            raise ConfigurationError("--zdr is unavailable with AgentBridge")
+        if native_codex and max_cost_usd is not None:
+            raise ConfigurationError("--max-cost-usd is unavailable with Codex subscription models")
+        if native_codex and zdr:
+            raise ConfigurationError("--zdr is unavailable with Codex subscription models")
         return cls(
             api_key=api_key,
-            backend=cast(Literal["openrouter", "agentbridge"], backend),
+            backend="agentbridge",
             base_url=base_url,
             image_model=image_model,
             review_model=review_model,
@@ -169,3 +149,14 @@ class Settings:
                 ),
             ),
         )
+
+
+def gateway_model(model: str) -> str:
+    """Keep the selected upstream model while adding the gateway namespace."""
+    if (
+        model.startswith(("codex/", "claudecode/"))
+        or (model.startswith("openrouter/") and model.count("/") >= 2)
+        or model == "openrouter/default"
+    ):
+        return model
+    return f"openrouter/{model}"

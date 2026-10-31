@@ -82,7 +82,7 @@ markers = [
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-src = ["src", "tests", "scripts", ".codex/skills/build-release/scripts"]
+src = ["src", "tests", "scripts", ".codex/skills/paperclean-cli_build-release/scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

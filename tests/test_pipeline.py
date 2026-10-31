@@ -310,7 +310,12 @@ def test_source_cleanup_records_broad_low_quality_warning_without_fallback(
 
     report = clean_image(
         output_paths(source),
-        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         BroadWarningClient(),
         force=False,
     )  # type: ignore[arg-type]
@@ -341,7 +346,7 @@ def test_clean_image_accepts_only_after_five_model_verifications(
     )  # type: ignore[arg-type]
     assert report.pages[0].status == "model_generated_clean"
     assert report.schema_version == 7
-    assert report.backend == "openrouter"
+    assert report.backend == "agentbridge"
     assert report.billing_mode == "openrouter_usd"
     assert report.verification_model == "openai/gpt-5.6-sol"
     assert report.verification_strategy == "full-page-plus-four-registered-regions"
@@ -821,7 +826,6 @@ def test_clean_image_records_agentbridge_subscription_provenance(
     paths = output_paths(source)
     settings = Settings(
         api_key="",
-        backend="agentbridge",
         base_url="http://127.0.0.1:8082/api/v1",
         image_model="codex/gpt-6-astra",
         review_model="codex/gpt-6-astra",
@@ -864,7 +868,6 @@ def test_agentbridge_ordinary_scan_verifies_source_cleanup_before_generation(
     client = SourceFirstClient()
     settings = Settings(
         api_key="",
-        backend="agentbridge",
         base_url="http://127.0.0.1:8082/api/v1",
         image_model="codex/gpt-6-astra",
         review_model="codex/gpt-6-astra",
@@ -918,7 +921,6 @@ def test_agentbridge_repairs_authored_hole_before_full_page_generation(
     client = SourceFirstClient()
     settings = Settings(
         api_key="",
-        backend="agentbridge",
         base_url="http://127.0.0.1:8082/api/v1",
         image_model="codex/gpt-6-astra",
         review_model="codex/gpt-6-astra",
@@ -965,7 +967,6 @@ def test_high_confidence_reading_rotation_precedes_cleanup_and_review(
 
     settings = Settings(
         api_key="",
-        backend="agentbridge",
         base_url="http://127.0.0.1:8082/api/v1",
         image_model="codex/gpt-6-astra",
         review_model="codex/gpt-6-astra",
@@ -1416,7 +1417,12 @@ def test_source_cleanup_erases_residual_hole_before_probable_reconstruction(
 
     report = clean_image(
         output_paths(source),
-        Settings(api_key="fake", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="fake",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         FakeClient(),
         force=False,
     )  # type: ignore[arg-type]
@@ -1550,7 +1556,12 @@ def test_authored_hole_repair_confirms_local_rejection_before_retrying(
     monkeypatch.setattr("paperclean.pipeline.repair_region", repair)
     report = clean_image(
         output_paths(source),
-        Settings(api_key="fake", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="fake",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         MissingThenRestoredClient(),
         force=False,
     )  # type: ignore[arg-type]
@@ -1764,7 +1775,12 @@ def test_agentbridge_does_not_repeat_failed_source_cleanup(tmp_path: Path, monke
 
     report = clean_image(
         output_paths(source),
-        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         LowQualityClient(),
         force=False,
     )  # type: ignore[arg-type]
@@ -1829,7 +1845,12 @@ def test_source_cleanup_repairs_only_localized_quality_regions(tmp_path: Path, m
 
     report = clean_image(
         output_paths(source),
-        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         FakeClient(),
         force=False,
     )  # type: ignore[arg-type]
@@ -1903,7 +1924,12 @@ def test_source_cleanup_refines_broad_quality_localization_once(
 
     report = clean_image(
         output_paths(source),
-        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         FakeClient(),
         force=False,
     )  # type: ignore[arg-type]
@@ -1975,7 +2001,12 @@ def test_source_cleanup_consumes_new_final_consensus_regions_within_global_budge
 
     report = clean_image(
         output_paths(source),
-        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         FakeClient(),
         force=False,
     )  # type: ignore[arg-type]
@@ -2036,7 +2067,12 @@ def test_source_cleanup_isolates_multiple_quality_repairs(tmp_path: Path, monkey
 
     report = clean_image(
         output_paths(source),
-        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         FakeClient(),
         force=False,
     )  # type: ignore[arg-type]
@@ -2139,7 +2175,12 @@ def test_source_cleanup_prefers_contained_edge_erase_before_model_repair(
 
     report = clean_image(
         output_paths(source),
-        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         FakeClient(),
         force=False,
     )  # type: ignore[arg-type]
@@ -2220,7 +2261,12 @@ def test_source_cleanup_tries_model_when_deterministic_quality_repair_stays_dirt
     client = LocallyVerifiedClient()
     report = clean_image(
         output_paths(source),
-        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         client,
         force=False,
     )  # type: ignore[arg-type]
@@ -2290,7 +2336,12 @@ def test_detector_confirmed_fold_clearance_overrides_stale_model_quality_box(
 
     report = clean_image(
         output_paths(source),
-        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         StaleFoldQualityClient(),
         force=False,
     )  # type: ignore[arg-type]
@@ -2352,7 +2403,12 @@ def test_objectively_blank_margin_overrides_stale_model_quality_box(
 
     report = clean_image(
         output_paths(source),
-        Settings(api_key="", backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key="",
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         StaleMarginQualityClient(),
         force=False,
     )  # type: ignore[arg-type]
@@ -2399,7 +2455,12 @@ def test_source_cleanup_requires_quality_consensus_before_regeneration(
     client = TransientQualityClient()
     report = clean_image(
         output_paths(source),
-        Settings(api_key=None, backend="agentbridge", max_attempts=1),
+        Settings(
+            api_key=None,
+            image_model="codex/gpt-6.1-sol",
+            review_model="codex/gpt-6.1-sol",
+            max_attempts=1,
+        ),
         client,
         force=False,
     )  # type: ignore[arg-type]

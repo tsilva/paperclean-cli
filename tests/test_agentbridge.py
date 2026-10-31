@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -10,7 +11,16 @@ from PIL import Image
 
 from paperclean.agentbridge import AgentBridgeClient
 from paperclean.config import Settings
-from paperclean.errors import GlobalProviderError, ProviderError
+from paperclean.discovery import output_paths
+from paperclean.errors import (
+    ContentPolicyError,
+    GlobalProviderError,
+    PayloadTooLargeError,
+    ProviderError,
+)
+from paperclean.models import AttemptRecord, PageRecord
+from paperclean.pipeline import _base_report, _error_name
+from paperclean.provenance import write_report
 
 
 def _png_bytes(color: str = "white") -> bytes:
@@ -20,9 +30,112 @@ def _png_bytes(color: str = "white") -> bytes:
 
 
 def _settings(**overrides: object) -> Settings:
-    values: dict[str, object] = {"backend": "agentbridge"}
+    values: dict[str, object] = {
+        "image_model": "codex/gpt-6.1-sol",
+        "review_model": "codex/gpt-6.1-sol",
+    }
     values.update(overrides)
     return Settings.from_sources(values, {})
+
+
+@pytest.mark.parametrize("model", ["codex/gpt-6.1-sol", "openai/gpt-image-2"])
+@pytest.mark.parametrize("gateway_key", ["", "dummy-gateway-placeholder"])
+def test_gateway_authentication_header_is_optional(model: str, gateway_key: str) -> None:
+    settings = Settings.from_sources(
+        {"image_model": model, "review_model": model},
+        {"AGENTBRIDGE_API_KEY": gateway_key},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if gateway_key:
+            assert request.headers["Authorization"] == f"Bearer {gateway_key}"
+        else:
+            assert "Authorization" not in request.headers
+        return httpx.Response(200, json={})
+
+    with AgentBridgeClient(settings, transport=httpx.MockTransport(handler)) as client:
+        client._client.get("/capabilities")
+
+
+@pytest.mark.parametrize("model", ["codex/gpt-6.1-sol", "openai/gpt-image-2"])
+@pytest.mark.parametrize("status", [422, 400, 200, 402])
+@pytest.mark.parametrize("code_field", ["type", "code"])
+def test_provider_errors_cannot_reflect_credentials_into_diagnostics_or_reports(
+    model: str, status: int, code_field: str, tmp_path: Path
+) -> None:
+    gateway_key = "dummy-gateway-placeholder"
+    upstream_key = "dummy-upstream-credential-unknown-to-client"
+    reflected = f"credits: {gateway_key} {upstream_key}"
+    settings = Settings.from_sources(
+        {"image_model": model, "review_model": model}, {"AGENTBRIDGE_API_KEY": gateway_key}
+    )
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            status, json={"error": {code_field: reflected, "message": reflected}}
+        )
+    )
+    with (
+        AgentBridgeClient(settings, transport=transport) as client,
+        pytest.raises(ProviderError) as raised,
+    ):
+        if client._metered:
+            client._metered._request("POST", "/images", json_body={}, retries=1)
+        else:
+            client._request("POST", "/images", json_body={})
+
+    error = raised.value
+    assert error.status_code == status
+    assert error.error_type == "provider_error"
+    assert _error_name(error) == "provider_error"
+    source = tmp_path / "input.png"
+    source.write_bytes(_png_bytes())
+    report = _base_report(output_paths(source), settings)
+    report.pages.append(
+        PageRecord(
+            page=1,
+            status="original_fallback",
+            source_render_sha256="source",
+            final_render_sha256="source",
+            attempts=[AttemptRecord(number=1, error_type=_error_name(error))],
+        )
+    )
+    report_path = tmp_path / "report.json"
+    write_report(report_path, report.as_dict())
+    public_output = str(error) + json.dumps(error.__dict__) + report_path.read_text()
+    assert gateway_key not in public_output
+    assert upstream_key not in public_output
+    assert json.loads(report_path.read_text())["pages"][0]["attempts"][0]["error_type"] == (
+        "provider_error"
+    )
+
+
+@pytest.mark.parametrize("model", ["codex/gpt-6.1-sol", "openai/gpt-image-2"])
+@pytest.mark.parametrize(
+    ("status", "error_type", "error_class"),
+    [
+        (422, "timeout_error", ProviderError),
+        (422, "no_output", ProviderError),
+        (200, "moderation", ContentPolicyError),
+        (413, "image_too_large", PayloadTooLargeError),
+    ],
+)
+def test_known_provider_error_classifications_remain_available(
+    model: str, status: int, error_type: str, error_class: type[ProviderError]
+) -> None:
+    settings = Settings.from_sources({"image_model": model, "review_model": model}, {})
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(status, json={"error": {"type": error_type}})
+    )
+    with (
+        AgentBridgeClient(settings, transport=transport) as client,
+        pytest.raises(error_class) as raised,
+    ):
+        if client._metered:
+            client._metered._request("POST", "/images", json_body={}, retries=1)
+        else:
+            client._request("POST", "/images", json_body={})
+    assert raised.value.status_code == status
+    assert _error_name(raised.value) == error_type
 
 
 def test_agentbridge_client_runs_preflight_generation_and_structured_review() -> None:
@@ -48,12 +161,12 @@ def test_agentbridge_client_runs_preflight_generation_and_structured_review() ->
         if path == "/api/v1/models":
             return httpx.Response(
                 200,
-                json={"data": [{"id": "codex/gpt-6-astra", "object": "model"}]},
+                json={"data": [{"id": "codex/gpt-6.1-sol", "object": "model"}]},
             )
         body = json.loads(request.content)
-        assert body["model"] == "codex/gpt-6-astra"
+        assert body["model"] == "codex/gpt-6.1-sol"
         if path == "/api/v1/chat/completions":
-            assert body["reasoning_effort"] == "low"
+            assert body["reasoning_effort"] == "high"
         calls.append((path, body))
         if path == "/api/v1/images":
             return httpx.Response(

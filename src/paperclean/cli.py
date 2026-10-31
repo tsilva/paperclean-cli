@@ -22,11 +22,7 @@ from paperclean import __version__
 from paperclean.agentbridge import AgentBridgeClient
 from paperclean.config import Settings
 from paperclean.discovery import OutputPaths, check_collision, discover, output_paths
-from paperclean.environment import (
-    discover_runtime_environment,
-    relaunch_with_keyenv,
-    restore_keyenv_working_directory,
-)
+from paperclean.environment import discover_runtime_environment
 from paperclean.errors import (
     ConfigurationError,
     GlobalProviderError,
@@ -34,7 +30,6 @@ from paperclean.errors import (
     OutputCollisionError,
     PaperCleanError,
 )
-from paperclean.openrouter import OpenRouterClient
 from paperclean.pdfs import page_count
 from paperclean.pipeline import clean_document, report_has_fallback, report_summary
 from paperclean.preflight import CostProjection
@@ -56,13 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-attempts", type=int, help="generation attempts per page (default: 3)"
     )
     parser.add_argument(
-        "--backend",
-        choices=("openrouter", "agentbridge"),
-        help="model backend (default: openrouter)",
-    )
-    parser.add_argument(
         "--agentbridge-base-url",
-        help="loopback AgentBridge API base URL",
+        help="AgentBridge API base URL",
     )
     parser.add_argument(
         "--agentbridge-timeout",
@@ -80,18 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _settings(args: argparse.Namespace, relaunch_args: Sequence[str]) -> Settings:
+def _settings(args: argparse.Namespace) -> Settings:
     runtime = discover_runtime_environment()
-    backend = (
-        str(args.backend or runtime.values.get("PAPERCLEAN_BACKEND", "openrouter")).strip().lower()
-    )
-    if args.agentbridge_base_url is not None and backend != "agentbridge":
-        raise ConfigurationError("--agentbridge-base-url requires --backend agentbridge")
-    if runtime.keyenv_manifest is not None and backend == "openrouter":
-        relaunch_with_keyenv(runtime, relaunch_args)
     return Settings.from_sources(
         {
-            "backend": args.backend,
             "base_url": args.agentbridge_base_url,
             "agentbridge_timeout": args.agentbridge_timeout,
             "jobs": args.jobs,
@@ -328,9 +310,7 @@ def _process_documents(
 
 
 def run(argv: Sequence[str] | None = None) -> int:
-    relaunch_args = list(sys.argv[1:] if argv is None else argv)
     try:
-        restore_keyenv_working_directory()
         args = build_parser().parse_args(argv)
         sources = discover(args.input)
         if not sources:
@@ -347,13 +327,11 @@ def run(argv: Sequence[str] | None = None) -> int:
                 print(f"skip existing: {item.output}", file=sys.stderr)
         if not paths:
             return 0
-        settings = _settings(args, relaunch_args)
+        settings = _settings(args)
         pages = _count_pages(paths)
         raw_client = cast(
             ModelClient,
-            AgentBridgeClient(settings)
-            if settings.backend == "agentbridge"
-            else OpenRouterClient(settings),
+            AgentBridgeClient(settings),
         )
         with raw_client as client:
             client.preflight()

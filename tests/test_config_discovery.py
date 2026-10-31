@@ -19,8 +19,8 @@ def test_settings_precedence_and_cost_serialization() -> None:
             "PAPERCLEAN_MAX_COST_USD": "1.25",
         },
     )
-    assert settings.image_model == "vendor/cli-model"
-    assert settings.review_model == "vendor/reviewer"
+    assert settings.image_model == "openrouter/vendor/cli-model"
+    assert settings.review_model == "openrouter/vendor/reviewer"
     assert settings.jobs == 4
     assert settings.paid_jobs == 1
 
@@ -33,18 +33,19 @@ def test_legacy_review_toggle_is_rejected_because_verification_is_mandatory() ->
         )
 
 
-def test_settings_require_secret() -> None:
-    with pytest.raises(ConfigurationError, match="keyenv"):
-        Settings.from_sources({}, {})
+def test_settings_ignore_upstream_secret_and_need_no_gateway_token() -> None:
+    assert Settings.from_sources({}, {"OPENROUTER_API_KEY": "must-not-forward"}).api_key == ""
 
 
 def test_agentbridge_settings_need_no_openrouter_key_and_use_codex_defaults() -> None:
-    settings = Settings.from_sources({"backend": "agentbridge"}, {})
+    settings = Settings.from_sources(
+        {"image_model": "codex/gpt-6.1-sol", "review_model": "codex/gpt-6.1-sol"}, {}
+    )
 
     assert settings.api_key == ""
     assert settings.base_url == "http://127.0.0.1:8082/api/v1"
-    assert settings.image_model == "codex/gpt-6-astra"
-    assert settings.review_model == "codex/gpt-6-astra"
+    assert settings.image_model == "codex/gpt-6.1-sol"
+    assert settings.review_model == "codex/gpt-6.1-sol"
     assert settings.agentbridge_timeout == 660
 
 
@@ -52,14 +53,24 @@ def test_agentbridge_settings_need_no_openrouter_key_and_use_codex_defaults() ->
     ("overrides", "message"),
     [
         (
-            {"backend": "agentbridge", "base_url": "https://bridge.example/api/v1"},
-            "loopback",
+            {"backend": "agentbridge", "base_url": "https://openrouter.ai/api/v1"},
+            "AgentBridge endpoint",
         ),
-        ({"backend": "agentbridge", "max_cost_usd": "1"}, "max-cost-usd"),
-        ({"backend": "agentbridge", "zdr": True}, "zdr"),
         (
-            {"backend": "agentbridge", "image_model": "openai/gpt-image-2"},
-            "codex/",
+            {
+                "image_model": "codex/gpt-6.1-sol",
+                "review_model": "codex/gpt-6.1-sol",
+                "max_cost_usd": "1",
+            },
+            "max-cost-usd",
+        ),
+        (
+            {"image_model": "codex/gpt-6.1-sol", "review_model": "codex/gpt-6.1-sol", "zdr": True},
+            "zdr",
+        ),
+        (
+            {"image_model": "openai/gpt-image-2", "review_model": "codex/gpt-6.1-sol"},
+            "same model family",
         ),
     ],
 )
