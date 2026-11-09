@@ -1,18 +1,18 @@
 ---
-name: build-release
-description: Build, tag, publish, monitor, or verify a PaperClean PyPI release. Use when the user asks to cut a release, publish paperclean-cli, build release artifacts, invoke $build-release, or confirm that a version is live.
+name: paperclean-cli_build-release
+description: Build, tag, publish, monitor, or verify a PaperClean PyPI release. Use when the user asks to cut a release, publish paperclean-cli, build release artifacts, invoke $paperclean-cli_build-release, or confirm that a version is live.
 ---
 
 # Build Release
 
-Read and apply the shared `$release-workflow` skill at
-`/Users/tsilva/.codex/skills/release-workflow/SKILL.md` before execution.
-It owns common preflight, publication safeguards, `$push` integration,
+Read and apply the shared `$private-skills_release-workflow` skill at
+`/Users/tsilva/.codex/skills/private-skills/private-skills_release-workflow/SKILL.md` before execution.
+It owns common preflight, publication safeguards, `$private-skills_push` integration,
 workflow monitoring, verification, and reporting. The rules below are this
 project's adapter; they retain its invocation default and required gates.
 If the shared skill is unavailable, stop and report the missing dependency.
 
-A bare `$build-release` or `/build-release` invocation requests the full
+A bare `$paperclean-cli_build-release` or `/paperclean-cli_build-release` invocation requests the full
 publication flow. Explicitly local, dry-run, or inspection requests must not
 launch `scripts/release.py`, which commits, tags, and pushes.
 
@@ -69,7 +69,7 @@ the GitHub Release for the same tag.
 Use the existing exact-version verifier:
 
 ```bash
-python .codex/skills/build-release/scripts/release_build.py \
+python .codex/skills/paperclean-cli_build-release/scripts/release_build.py \
   wait-pypi --version <version>
 ```
 

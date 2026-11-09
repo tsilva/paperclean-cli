@@ -12,45 +12,30 @@ JPEG, PNG, or folder; it recreates each page, runs local safety checks, requires
 mandatory model verification, and falls back to the original page when a candidate
 cannot be trusted.
 
-Complete page pixels are sent through the configured backend: OpenRouter, or a
-loopback AgentBridge server backed by your authenticated Codex CLI. Before work
-begins, PaperClean shows a preflight and asks for confirmation. OpenRouter mode
-includes live cost and credit checks; AgentBridge mode shows model-call ceilings
-because Codex subscription USD usage is not exposed. Every generated page must pass
+Complete page pixels are sent to AgentBridge, which owns the selected model’s
+provider credentials. Before work begins, PaperClean shows a preflight and asks
+for confirmation. OpenRouter models include live cost and credit checks through
+the gateway; Codex models show model-call ceilings because subscription USD usage
+is not exposed. Every generated page must pass
 local geometry and foreground checks plus five-view multimodal fidelity verification.
 
 ## Install
 
-PaperClean requires Python 3.11 or newer. Keyenv is recommended on macOS:
+PaperClean requires Python 3.11 or newer:
 
 ```bash
-uv tool install keyenv-macos
 uv tool install paperclean-cli
 ```
 
 The PyPI distribution is named `paperclean-cli`; it installs the `paperclean`
 command and Python package.
 
-Keyenv is the recommended way to keep `OPENROUTER_API_KEY` in the macOS
-Keychain. Create `~/.config/keyenv/.keyenv.toml`:
-
-```toml
-[keyenv]
-version = 1
-
-[secrets.OPENROUTER_API_KEY]
-account = "paperclean-user/OPENROUTER_API_KEY"
-required = true
-```
-
-Authorize and store the key:
-
-```bash
-cd ~/.config/keyenv
-keyenv authorize OPENROUTER_API_KEY
-keyenv set OPENROUTER_API_KEY
-keyenv doctor
-```
+AgentBridge owns provider credentials. Use a local gateway configured to accept
+requests without an application API key; PaperClean needs no gateway credential
+for that setup. Authenticated agent use is blocked until a compatible native
+sandboxed Infisical proxy route is separately reviewed and verified. This
+repository does not provision that route. Never store a gateway token in a
+plaintext file or supply a real key through raw environment injection.
 
 Run PaperClean from the directory containing your document:
 
@@ -59,14 +44,14 @@ paperclean document.pdf
 ```
 
 To run generation and mandatory verification through Codex instead, start the sibling
-AgentBridge checkout and select its backend. No OpenRouter key is needed:
+AgentBridge checkout and select the Codex models. No OpenRouter key is needed:
 
 ```bash
 cd ../agentbridge
 uv run agentbridge
 
 # In another terminal, from the directory containing the document:
-paperclean document.pdf --backend agentbridge --yes
+paperclean document.pdf --image-model codex/gpt-6.1-sol --review-model codex/gpt-6.1-sol --yes
 ```
 
 ## Document review workspace
@@ -116,7 +101,7 @@ persist in `tmp/paperclean-lab/` (ignored by Git); change this with `--data-dir`
 paperclean document.pdf                         # clean one PDF
 paperclean photo.jpg                            # clean one JPEG or PNG
 paperclean scans/                               # recursively clean a directory
-paperclean document.pdf --backend agentbridge   # use Codex through local AgentBridge
+paperclean document.pdf --image-model codex/gpt-6.1-sol --review-model codex/gpt-6.1-sol   # use Codex through local AgentBridge
 paperclean document.pdf --max-attempts 3        # set generation attempts per page
 paperclean document.pdf --max-cost-usd 1.00     # set a soft observed-cost ceiling
 paperclean document.pdf --review-model openai/gpt-5.6-sol  # select verifier
@@ -139,9 +124,7 @@ CLI flags override environment variables, which override these defaults:
 
 | Environment variable | Default |
 | --- | --- |
-| `PAPERCLEAN_BACKEND` | `openrouter` |
-| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` |
-| `PAPERCLEAN_AGENTBRIDGE_BASE_URL` | `http://127.0.0.1:8082/api/v1` |
+| `AGENTBRIDGE_BASE_URL` | `http://127.0.0.1:8082/api/v1` |
 | `PAPERCLEAN_AGENTBRIDGE_TIMEOUT` | `660` |
 | `PAPERCLEAN_IMAGE_MODEL` | `openai/gpt-image-2` |
 | `PAPERCLEAN_REVIEW_MODEL` | `openai/gpt-5.6-sol` |
@@ -150,11 +133,20 @@ CLI flags override environment variables, which override these defaults:
 | `PAPERCLEAN_MAX_COST_USD` | unset |
 | `PAPERCLEAN_ZDR` | `false` |
 
-`OPENROUTER_API_KEY` is required only for the default OpenRouter backend.
-AgentBridge defaults both models to `codex/gpt-6-astra` with low reasoning, requires a loopback URL,
-and does not support `--max-cost-usd` or `--zdr`. PaperClean reads supported
-values from the process environment first, then user-level `.env` or Keyenv
-configuration, then repository-level configuration.
+`AGENTBRIDGE_API_KEY` is optional gateway authentication. The gateway owns upstream credentials.
+Existing default OpenRouter image and review models are retained through AgentBridge.
+Select `codex/gpt-6.1-sol` for both models to use subscription mode; that mode does
+not support `--max-cost-usd` or `--zdr`. The CLI accepts optional gateway
+authentication only from the process environment and ignores it in `.env` files.
+For agent use, a separately reviewed native sandboxed proxy route must supply
+its own configured placeholder through `AGENTBRIDGE_API_KEY`; no such route or
+placeholder is configured by this repository. Until that review and verification,
+use the local gateway without application authentication. Do not use raw secret
+injection or another project's credentials as a fallback.
+
+Non-secret settings are read from the repository `.env`, then
+`~/.config/paperclean/.env`, then the process environment, with later sources
+overriding earlier ones. The CLI does not read or relaunch legacy manifests.
 
 ## Notes
 
@@ -186,6 +178,9 @@ configuration, then repository-level configuration.
 - The cost preflight checks selected endpoints, live pricing, available credits,
   and the conservative recovery ceiling. `--yes` accepts the displayed
   preflight but never overrides insufficient known credits.
+- Provider failures expose fixed public messages and recognized error codes in
+  reports. Arbitrary upstream error text and billing details are withheld because
+  they can contain credentials or document content.
 - The AgentBridge preflight verifies Codex availability, authentication, native
   image generation, strict JSON Schema output, and both selected models. It shows
   conservative call counts and records observable orchestration tokens, but
@@ -213,7 +208,7 @@ uv run ruff check .             # lint
 uv run mypy -p paperclean       # type-check
 uv run pytest                   # run the offline test suite
 uv build --no-sources           # build wheel and source distribution
-keyenv run -- uv run pytest -m live  # run opt-in live tests
+uv run pytest -m live  # run opt-in live tests
 ```
 
 Release workflow validation uses `python3 scripts/release.py --validate` to
@@ -225,6 +220,15 @@ smoke-tests the downloaded wheel in an isolated environment.
 
 ![PaperClean architecture](./architecture.png)
 
+## AgentBridge routing
+
+Model requests use only AgentBridge. Set `AGENTBRIDGE_BASE_URL` to its API root
+(default `http://127.0.0.1:8082/api/v1`). `AGENTBRIDGE_API_KEY` is an optional
+gateway token. OpenRouter credentials belong to AgentBridge. Existing model
+choices are retained; raw upstream IDs gain `openrouter/` only on outbound
+requests. There is no direct OpenRouter endpoint or fallback. Hosted deployments
+must configure a reachable AgentBridge URL instead of the loopback default.
+
 ## License
 
-No license file has been added yet.
+MIT. See [LICENSE](LICENSE).

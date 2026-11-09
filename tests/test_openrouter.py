@@ -9,9 +9,11 @@ import httpx
 import pytest
 from PIL import Image
 
+from paperclean.agentbridge import AgentBridgeClient
 from paperclean.config import Settings
 from paperclean.errors import GlobalOpenRouterError, PayloadTooLargeError
-from paperclean.openrouter import CostTracker, OpenRouterClient
+from paperclean.openrouter import CostTracker
+from paperclean.openrouter import MeteredModelOperations as OpenRouterClient
 
 
 def _png_base64() -> str:
@@ -29,7 +31,8 @@ def test_preflight_generation_and_review_contract() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path == "/api/v1/images/models/openai/gpt-image-2/endpoints":
+        assert request.url.host == "127.0.0.1"
+        if request.url.path == "/api/v1/openrouter/images/models/openai/gpt-image-2/endpoints":
             return httpx.Response(
                 200,
                 json={
@@ -49,7 +52,7 @@ def test_preflight_generation_and_review_contract() -> None:
                     }
                 },
             )
-        if request.url.path == "/api/v1/models/openai/gpt-5.6-sol/endpoints":
+        if request.url.path == "/api/v1/openrouter/models/openai/gpt-5.6-sol/endpoints":
             return httpx.Response(
                 200,
                 json={
@@ -71,6 +74,7 @@ def test_preflight_generation_and_review_contract() -> None:
             )
         if request.url.path == "/api/v1/images":
             body = json.loads(request.content)
+            assert body["model"] == "openrouter/openai/gpt-image-2"
             assert body["provider"]["only"] == ["openai"]
             assert body["input_references"][0]["type"] == "image_url"
             assert body["input_references"][0]["image_url"]["url"].startswith(
@@ -82,6 +86,7 @@ def test_preflight_generation_and_review_contract() -> None:
             )
         if request.url.path == "/api/v1/chat/completions":
             body = json.loads(request.content)
+            assert body["model"] == "openrouter/openai/gpt-5.6-sol"
             assert body["response_format"]["json_schema"]["strict"] is True
             assert body["provider"] == {"only": ["openai"], "require_parameters": True}
             assert body["reasoning_effort"] == "medium"
@@ -96,7 +101,7 @@ def test_preflight_generation_and_review_contract() -> None:
             )
         raise AssertionError(request.url)
 
-    with OpenRouterClient(_settings(), transport=httpx.MockTransport(handler)) as client:
+    with AgentBridgeClient(_settings(), transport=httpx.MockTransport(handler)) as client:
         client.preflight()
         image = Image.new("RGB", (32, 32), "white")
         assert client.generate(image, "clean", max_edge=4096).size == (32, 32)
@@ -345,7 +350,7 @@ def test_image_too_large_400_is_typed_for_one_downscale_retry() -> None:
         client._request("POST", "/images", json_body={}, paid=True, retries=1)
 
 
-def test_payment_error_preserves_short_billing_detail() -> None:
+def test_payment_error_preserves_billing_classification_without_provider_detail() -> None:
     detail = (
         "This request requires more credits, or fewer max_tokens. "
         "You requested up to 16384 tokens, but can only afford 3594."
@@ -359,7 +364,7 @@ def test_payment_error_preserves_short_billing_detail() -> None:
     ):
         client._request("POST", "/images", json_body={}, paid=True, retries=1)
 
-    assert str(raised.value) == f"OpenRouter payment required: {detail}"
+    assert str(raised.value) == "OpenRouter credits or payment are required"
     assert raised.value.status_code == 402
 
 

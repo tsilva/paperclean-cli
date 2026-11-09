@@ -15,7 +15,7 @@ from typing import Any, Literal, cast
 import httpx
 from PIL import Image
 
-from paperclean.config import Settings
+from paperclean.config import Settings, gateway_model
 from paperclean.errors import (
     ContentPolicyError,
     CostLimitReached,
@@ -59,16 +59,6 @@ ALLOWED_CATEGORIES = (
     "other_content",
 )
 ALLOWED_SEVERITIES = ("low", "medium", "high", "critical")
-PAYMENT_ERROR_TERMS = (
-    "afford",
-    "balance",
-    "credit",
-    "fund",
-    "max_token",
-    "payment",
-    "spend limit",
-    "usage limit",
-)
 GENERIC_PAYMENT_ERROR = "OpenRouter credits or payment are required"
 
 REVIEW_SCHEMA: dict[str, Any] = {
@@ -292,7 +282,7 @@ def _retry_after(response: httpx.Response) -> float:
             return 1.0
 
 
-class OpenRouterClient:
+class MeteredModelOperations:
     def __init__(self, settings: Settings, *, transport: httpx.BaseTransport | None = None) -> None:
         self.settings = settings
         self.backend_version: str | None = None
@@ -300,7 +290,7 @@ class OpenRouterClient:
         self._client = httpx.Client(
             base_url=settings.base_url,
             headers={
-                "Authorization": f"Bearer {settings.api_key}",
+                **({"Authorization": f"Bearer {settings.api_key}"} if settings.api_key else {}),
                 "Content-Type": "application/json",
                 "HTTP-Referer": "https://github.com/tsilva/paperclean-cli",
                 "X-Title": "PaperClean",
@@ -311,7 +301,7 @@ class OpenRouterClient:
         self.image_endpoint: Endpoint | None = None
         self.review_endpoint: Endpoint | None = None
 
-    def __enter__(self) -> OpenRouterClient:
+    def __enter__(self) -> MeteredModelOperations:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -326,6 +316,10 @@ class OpenRouterClient:
         paid: bool = False,
         retries: int = 3,
     ) -> dict[str, Any]:
+        if method == "GET":
+            path = "/openrouter/" + path.lstrip("/")
+        elif json_body is not None and "model" in json_body:
+            json_body = {**json_body, "model": gateway_model(str(json_body["model"]))}
         if paid:
             self.costs.before_request()
         for attempt in range(retries):
@@ -369,10 +363,12 @@ class OpenRouterClient:
                         raise ContentPolicyError(
                             "the provider rejected this page under its content policy",
                             error_type=error_type,
+                            status_code=response.status_code,
                         )
                     raise OpenRouterError(
                         "the provider failed while producing a result",
                         error_type=error_type,
+                        status_code=response.status_code,
                     )
                 return value
             error = _error_data(response)
@@ -388,7 +384,9 @@ class OpenRouterClient:
             if response.status_code == 413 or any(
                 item in normalized for item in ("image_too_large", "too large")
             ):
-                raise PayloadTooLargeError(message, error_type=error_type, status_code=413)
+                raise PayloadTooLargeError(
+                    "OpenRouter rejected the image size", error_type=error_type, status_code=413
+                )
             if response.status_code in {400, 422} and any(
                 item in normalized
                 for item in (
@@ -400,12 +398,14 @@ class OpenRouterClient:
                 )
             ):
                 raise ContentPolicyError(
-                    message, error_type=error_type, status_code=response.status_code
+                    "the provider rejected this page under its content policy",
+                    error_type=error_type,
+                    status_code=response.status_code,
                 )
             if response.status_code in {401, 402, 403, 404}:
                 safe_messages = {
                     401: "OpenRouter authentication failed",
-                    402: _safe_payment_error(message),
+                    402: GENERIC_PAYMENT_ERROR,
                     403: "OpenRouter permission denied",
                     404: "OpenRouter model or endpoint was not found",
                 }
@@ -414,7 +414,11 @@ class OpenRouterClient:
                     error_type=error_type,
                     status_code=response.status_code,
                 )
-            raise OpenRouterError(message, error_type=error_type, status_code=response.status_code)
+            raise OpenRouterError(
+                f"OpenRouter request failed with HTTP {response.status_code}",
+                error_type=error_type,
+                status_code=response.status_code,
+            )
         raise AssertionError("unreachable")
 
     def _select_endpoint(
@@ -424,7 +428,7 @@ class OpenRouterClient:
         images_api: bool,
         predicate: Callable[[frozenset[str], dict[str, Any]], bool],
     ) -> Endpoint:
-        author, slug = _model_parts(model)
+        author, slug = _model_parts(model.removeprefix("openrouter/"))
         prefix = "/images" if images_api else ""
         response = self._request("GET", f"{prefix}/models/{author}/{slug}/endpoints")
         data = response.get("data", response)
@@ -855,20 +859,6 @@ def _error_data(response: httpx.Response) -> dict[str, Any]:
         error = value["error"]
         return cast(dict[str, Any], error)
     return value if isinstance(value, dict) else {}
-
-
-def _safe_payment_error(message: str) -> str:
-    """Retain actionable billing detail without echoing arbitrary provider content."""
-    detail = " ".join(message.split())
-    normalized = detail.lower()
-    if (
-        not detail
-        or len(detail) > 500
-        or not all(character.isprintable() for character in detail)
-        or not any(term in normalized for term in PAYMENT_ERROR_TERMS)
-    ):
-        return GENERIC_PAYMENT_ERROR
-    return f"OpenRouter payment required: {detail}"
 
 
 def _parse_verdict(value: Any, usage: UsageRecord) -> ReviewVerdict:

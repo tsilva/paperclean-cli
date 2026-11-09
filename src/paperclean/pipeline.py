@@ -1675,7 +1675,7 @@ def process_page(
                 fallback_reason="attempts_exhausted",
             ),
         )
-    if settings.backend == "agentbridge":
+    if settings.image_model.startswith("codex/"):
         try:
             source_first = _try_source_first_cleanup(
                 source,
@@ -1841,7 +1841,7 @@ def process_page(
             # have already been normalized as GlobalProviderError and propagate.
             continue
     if (
-        settings.backend != "agentbridge"
+        not settings.image_model.startswith("codex/")
         and not photographed_page
         and fallback_reason in {"attempts_exhausted", "provider_or_review_error"}
     ):
@@ -1910,7 +1910,7 @@ def _base_report(paths: OutputPaths, settings: Settings) -> DocumentReport:
         output_sha256=None,
         backend=settings.backend,
         billing_mode=(
-            "codex_subscription" if settings.backend == "agentbridge" else "openrouter_usd"
+            "codex_subscription" if settings.image_model.startswith("codex/") else "openrouter_usd"
         ),
         image_model=settings.image_model,
         verification_model=settings.review_model,
@@ -1922,7 +1922,7 @@ def _base_report(paths: OutputPaths, settings: Settings) -> DocumentReport:
 def _finish_report(report: DocumentReport, client: ModelClient) -> None:
     report.finished_at = _now()
     report.backend_version = getattr(client, "backend_version", None)
-    report.cost_usd = float(client.costs.total) if report.backend == "openrouter" else None
+    report.cost_usd = float(client.costs.total) if report.billing_mode == "openrouter_usd" else None
     report.prompt_tokens = client.costs.prompt_tokens
     report.completion_tokens = client.costs.completion_tokens
     report.total_tokens = client.costs.total_tokens

@@ -26,6 +26,7 @@ from paperclean.openrouter import (
     ORIENTATION_SCHEMA,
     PAGE_LOCATION_SCHEMA,
     REVIEW_SCHEMA,
+    MeteredModelOperations,
     _parse_verdict,
 )
 from paperclean.preflight import CostProjection, build_subscription_projection
@@ -76,13 +77,25 @@ class AgentBridgeClient:
 
     def __init__(self, settings: Settings, *, transport: httpx.BaseTransport | None = None) -> None:
         self.settings = settings
-        self.costs = SubscriptionUsageTracker()
+        self._metered = (
+            None
+            if settings.image_model.startswith("codex/")
+            else MeteredModelOperations(settings, transport=transport)
+        )
+        self.costs = self._metered.costs if self._metered else SubscriptionUsageTracker()
         self.backend_version: str | None = None
-        self._client = httpx.Client(
-            base_url=settings.base_url,
-            headers={"Content-Type": "application/json", "X-Title": "PaperClean"},
-            timeout=httpx.Timeout(float(settings.agentbridge_timeout), connect=5.0),
-            transport=transport,
+        self._client = (
+            self._metered._client
+            if self._metered
+            else httpx.Client(
+                base_url=settings.base_url,
+                headers={
+                    "Content-Type": "application/json",
+                    **({"Authorization": f"Bearer {settings.api_key}"} if settings.api_key else {}),
+                },
+                timeout=httpx.Timeout(float(settings.agentbridge_timeout), connect=5.0),
+                transport=transport,
+            )
         )
 
     def __enter__(self) -> AgentBridgeClient:
@@ -112,17 +125,21 @@ class AgentBridgeClient:
             value = response.json()
         except ValueError as exc:
             raise GlobalProviderError("AgentBridge returned invalid JSON") from exc
-        if response.status_code < 400:
-            if not isinstance(value, dict):
-                raise GlobalProviderError("AgentBridge returned an invalid response object")
+        if not isinstance(value, dict):
+            raise GlobalProviderError("AgentBridge returned an invalid response object")
+        error_body = value.get("error")
+        if response.status_code < 400 and not isinstance(error_body, dict):
             return value
-        error_body = value.get("error") if isinstance(value, dict) else None
         error_type = (
             str(error_body.get("type") or error_body.get("code") or "http_error")
             if isinstance(error_body, dict)
             else "http_error"
         )
-        safe_message = f"AgentBridge request failed with HTTP {response.status_code}"
+        safe_message = (
+            f"AgentBridge request failed with HTTP {response.status_code}"
+            if response.status_code >= 400
+            else "AgentBridge failed while producing a result"
+        )
         normalized = json.dumps(error_body).lower() if isinstance(error_body, dict) else ""
         if response.status_code == 413:
             raise PayloadTooLargeError(
@@ -130,7 +147,10 @@ class AgentBridgeClient:
                 error_type=error_type,
                 status_code=413,
             )
-        if any(term in normalized for term in ("content policy", "moderation", "refusal")):
+        if any(
+            term in normalized
+            for term in ("content policy", "content_policy", "moderation", "refusal", "safety")
+        ):
             raise ContentPolicyError(
                 "Codex rejected this page under its content policy",
                 error_type=error_type,
@@ -149,6 +169,8 @@ class AgentBridgeClient:
         )
 
     def preflight(self) -> None:
+        if self._metered:
+            return self._metered.preflight()
         capabilities = self._request("GET", "/capabilities", global_failure=True)
         self.backend_version = (
             str(capabilities.get("agentbridge_version"))
@@ -181,6 +203,10 @@ class AgentBridgeClient:
     def cost_projection(
         self, *, document_total: int, page_total: int, max_attempts: int
     ) -> CostProjection:
+        if self._metered:
+            return self._metered.cost_projection(
+                document_total=document_total, page_total=page_total, max_attempts=max_attempts
+            )
         return build_subscription_projection(
             document_total=document_total,
             page_total=page_total,
@@ -191,6 +217,8 @@ class AgentBridgeClient:
         )
 
     def generate(self, source: Image.Image, prompt: str, *, max_edge: int) -> Image.Image:
+        if self._metered:
+            return self._metered.generate(source, prompt, max_edge=max_edge)
         response = self._request(
             "POST",
             "/images",
@@ -226,6 +254,8 @@ class AgentBridgeClient:
             raise ProviderError("AgentBridge returned invalid image base64") from exc
 
     def locate_page(self, source: Image.Image) -> PageGeometry | None:
+        if self._metered:
+            return self._metered.locate_page(source)
         response = self._request(
             "POST",
             "/chat/completions",
@@ -252,7 +282,11 @@ class AgentBridgeClient:
                     "json_schema": PAGE_LOCATION_SCHEMA,
                 },
                 "reasoning_effort": (
-                    "low" if self.settings.review_model == "codex/gpt-6-astra" else "medium"
+                    "high"
+                    if self.settings.review_model == "codex/gpt-6.1-sol"
+                    else "low"
+                    if self.settings.review_model == "codex/gpt-6-astra"
+                    else "medium"
                 ),
                 "max_tokens": 1024,
                 "store": False,
@@ -328,6 +362,8 @@ class AgentBridgeClient:
             ) from exc
 
     def reading_rotation(self, source: Image.Image) -> int:
+        if self._metered:
+            return self._metered.reading_rotation(source)
         response = self._request(
             "POST",
             "/chat/completions",
@@ -354,7 +390,11 @@ class AgentBridgeClient:
                     "json_schema": ORIENTATION_SCHEMA,
                 },
                 "reasoning_effort": (
-                    "low" if self.settings.review_model == "codex/gpt-6-astra" else "medium"
+                    "high"
+                    if self.settings.review_model == "codex/gpt-6.1-sol"
+                    else "low"
+                    if self.settings.review_model == "codex/gpt-6-astra"
+                    else "medium"
                 ),
                 "max_tokens": 512,
                 "store": False,
@@ -379,6 +419,8 @@ class AgentBridgeClient:
         self, source: Image.Image, candidate: Image.Image, *, view_name: str
     ) -> ReviewVerdict:
         prompt = REVIEW_PROMPT.replace("{view_name}", view_name)
+        if self._metered:
+            return self._metered.review(source, candidate, view_name=view_name)
         response = self._request(
             "POST",
             "/chat/completions",
@@ -408,7 +450,11 @@ class AgentBridgeClient:
                 ],
                 "response_format": {"type": "json_schema", "json_schema": REVIEW_SCHEMA},
                 "reasoning_effort": (
-                    "low" if self.settings.review_model == "codex/gpt-6-astra" else "medium"
+                    "high"
+                    if self.settings.review_model == "codex/gpt-6.1-sol"
+                    else "low"
+                    if self.settings.review_model == "codex/gpt-6-astra"
+                    else "medium"
                 ),
                 "max_tokens": 2048,
                 "store": False,
@@ -428,6 +474,8 @@ class AgentBridgeClient:
             ) from exc
 
     def review_quality(self, candidate: Image.Image, *, view_name: str) -> ReviewVerdict:
+        if self._metered:
+            return self._metered.review_quality(candidate, view_name=view_name)
         prompt = CANDIDATE_QUALITY_PROMPT.replace("{view_name}", view_name)
         response = self._request(
             "POST",
@@ -453,7 +501,11 @@ class AgentBridgeClient:
                 ],
                 "response_format": {"type": "json_schema", "json_schema": REVIEW_SCHEMA},
                 "reasoning_effort": (
-                    "low" if self.settings.review_model == "codex/gpt-6-astra" else "medium"
+                    "high"
+                    if self.settings.review_model == "codex/gpt-6.1-sol"
+                    else "low"
+                    if self.settings.review_model == "codex/gpt-6-astra"
+                    else "medium"
                 ),
                 "max_tokens": 2048,
                 "store": False,

@@ -2,6 +2,25 @@
 
 from __future__ import annotations
 
+_PUBLIC_PROVIDER_ERROR_TYPES = frozenset(
+    {
+        "content_policy",
+        "content_policy_violation",
+        "generation_error",
+        "http_error",
+        "image_too_large",
+        "missing_image",
+        "moderation",
+        "network",
+        "no_output",
+        "no_output_error",
+        "refusal",
+        "safety",
+        "timeout",
+        "timeout_error",
+    }
+)
+
 
 class PaperCleanError(Exception):
     """Base class for expected PaperClean failures."""
@@ -34,7 +53,13 @@ class ProviderError(PaperCleanError):
         status_code: int | None = None,
     ) -> None:
         super().__init__(message)
-        self.error_type = error_type
+        # Provider codes can reflect upstream credentials unknown to this client.
+        # Only fixed, recognized labels may reach reports or public diagnostics.
+        self.error_type = (
+            error_type
+            if error_type is None or error_type in _PUBLIC_PROVIDER_ERROR_TYPES
+            else "provider_error"
+        )
         self.status_code = status_code
 
 

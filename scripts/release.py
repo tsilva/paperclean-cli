@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = ROOT / "pyproject.toml"
-HELPER = ROOT / ".codex/skills/build-release/scripts/release_build.py"
+HELPER = ROOT / ".codex/skills/paperclean-cli_build-release/scripts/release_build.py"
 VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 DISTRIBUTION = "paperclean-cli"
 ARTIFACT_STEM = "paperclean_cli"

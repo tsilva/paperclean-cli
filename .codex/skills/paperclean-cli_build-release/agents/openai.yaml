@@ -1,0 +1,4 @@
+interface:
+  display_name: "paperclean-cli: Build Release"
+  short_description: "Build and publish validated PyPI releases"
+  default_prompt: "Use $paperclean-cli_build-release to build, publish, and verify a PaperClean release."
