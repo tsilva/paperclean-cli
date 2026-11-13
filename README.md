@@ -30,12 +30,9 @@ uv tool install paperclean-cli
 The PyPI distribution is named `paperclean-cli`; it installs the `paperclean`
 command and Python package.
 
-AgentBridge owns provider credentials. Use a local gateway configured to accept
-requests without an application API key; PaperClean needs no gateway credential
-for that setup. Authenticated agent use is blocked until a compatible native
-sandboxed Infisical proxy route is separately reviewed and verified. This
-repository does not provision that route. Never store a gateway token in a
-plaintext file or supply a real key through raw environment injection.
+AgentBridge owns provider credentials. Configure the gateway URL and optional
+access token through PaperClean's normal environment settings. A gateway that
+accepts unauthenticated local requests needs no application access token.
 
 Run PaperClean from the directory containing your document:
 
